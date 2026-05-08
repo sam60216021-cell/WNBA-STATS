@@ -3,7 +3,7 @@ services:
     name: wnba-stats
     env: python
     region: oregon
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --preload
     envVars:
