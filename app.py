@@ -91,6 +91,32 @@ def norm(abbr: str) -> str:
     a = (abbr or "").upper().strip()
     return _ESPN_MAP.get(a, a)
 
+# ── stats.wnba.com JSON helpers ────────────────────────────────────────────────
+
+def _wnba_rs(data: dict, name: str) -> list[dict]:
+    """Parse a named resultSet from stats.wnba.com JSON into a list of dicts."""
+    for rs in (data or {}).get("resultSets", []):
+        if rs.get("name") == name:
+            headers = rs.get("headers", [])
+            return [dict(zip(headers, row)) for row in rs.get("rowSet", [])]
+    return []
+
+
+def _wnba_get(url: str, params: dict, cache_key: str = "", ttl: int = 3600):
+    """GET a stats.wnba.com endpoint with optional caching. Returns parsed JSON or None."""
+    if cache_key and (cached := cache_get(cache_key)):
+        return cached
+    try:
+        r = wnba_stats.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("wnba_stats request failed %s %s: %s", url, params, exc)
+        return None
+    if cache_key:
+        cache_set(cache_key, data, ttl=ttl)
+    return data
+
 def today_et() -> str:
     return datetime.now(ET).strftime("%Y-%m-%d")
 
@@ -238,16 +264,14 @@ def standings():
     cache_set("standings", result, ttl=600)
     return jsonify(result)
 
-# ── ESPN-based player roster ──────────────────────────────────────────────────
+# ── Player roster ──────────────────────────────────────────────────────────────
 
-def _fetch_all_players(season: str = CURRENT_SEASON) -> list[dict]:
+def _fetch_all_players_espn(season: str = CURRENT_SEASON) -> list[dict]:
     """
-    Fetches WNBA player roster from ESPN team roster endpoints.
-    Returns [{player_id, name, team, pos}, …].
-    Season parameter kept for API compatibility; ESPN always returns current roster.
-    Cached for 1 hour.
+    ESPN fallback: fetches WNBA player roster from ESPN team roster endpoints.
+    Returns [{player_id, name, team, pos}, …]. Cached for 1 hour.
     """
-    cache_key = "espn_players"
+    cache_key = f"espn_players_{season}"
     if (cached := cache_get(cache_key)):
         return cached
 
@@ -302,12 +326,199 @@ def _fetch_all_players(season: str = CURRENT_SEASON) -> list[dict]:
                     "pos":       pos,
                 })
 
-    log.info("Loaded %d players from ESPN rosters", len(players))
+    log.info("Loaded %d players from ESPN rosters (fallback)", len(players))
     cache_set(cache_key, players, ttl=3600)
     return players
 
 
-# ── ESPN box-score game-log index ──────────────────────────────────────────────
+def _fetch_all_players(season: str = CURRENT_SEASON) -> list[dict]:
+    """
+    Fetch WNBA roster using ESPN as primary source (stable ESPN athlete IDs).
+    Falls back to stats.wnba.com on failure.
+    Returns [{player_id, name, team, pos}, …]. Cached for 1 hour.
+
+    ESPN athlete IDs are used as the primary player_id so they remain consistent
+    with the bundled StarterLogs.json seed data and the ESPN box-score log index.
+    """
+    cache_key = f"wnba_players_{season}"
+    if (cached := cache_get(cache_key)):
+        return cached
+
+    # 1. Try ESPN first (returns stable ESPN athlete IDs)
+    players = _fetch_all_players_espn(season)
+    if players:
+        return players
+
+    # 2. Fall back to stats.wnba.com if ESPN fails
+    log.warning("ESPN roster empty — falling back to stats.wnba.com")
+    teams_data = _wnba_get(
+        "https://stats.wnba.com/stats/commonteamyears",
+        params={"LeagueID": "10"},
+        cache_key="wnba_team_ids",
+        ttl=86400,
+    )
+
+    team_ids: list[dict] = []
+    if teams_data:
+        for row in _wnba_rs(teams_data, "TeamYears"):
+            if str(row.get("MAX_YEAR", "")) >= season:
+                tid  = str(row.get("TEAM_ID", ""))
+                abbr = norm(row.get("ABBREVIATION", ""))
+                if tid and abbr:
+                    team_ids.append({"id": tid, "abbr": abbr})
+
+    if not team_ids:
+        log.warning("stats.wnba.com also returned no team list")
+        return []
+
+    for team in team_ids:
+        data = _wnba_get(
+            "https://stats.wnba.com/stats/commonteamroster",
+            params={"TeamID": team["id"], "Season": season, "LeagueID": "10"},
+        )
+        if not data:
+            continue
+        for row in _wnba_rs(data, "CommonTeamRoster"):
+            pid  = str(row.get("PLAYER_ID", ""))
+            name = row.get("PLAYER", "") or row.get("PLAYER_SLUG", "")
+            pos  = row.get("POSITION", "")
+            if pid and name:
+                players.append({
+                    "player_id": pid,
+                    "name":      name,
+                    "team":      team["abbr"],
+                    "pos":       pos,
+                })
+
+    if players:
+        log.info("Loaded %d players from stats.wnba.com rosters (fallback)", len(players))
+        cache_set(cache_key, players, ttl=3600)
+        return players
+
+    log.warning("Both ESPN and stats.wnba.com returned no players")
+    return []
+
+
+# ── stats.wnba.com player game logs ───────────────────────────────────────────
+
+def _parse_wnba_game_date(date_str: str) -> str:
+    """Normalise a stats.wnba.com game date to YYYY-MM-DD.
+    Handles: 'MAY 15, 2026', '2026-05-15', '05/15/2026'."""
+    if not date_str:
+        return ""
+    s = date_str.strip()
+    if len(s) == 10 and s[4] == "-":        # already ISO
+        return s
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return s
+
+
+def _parse_wnba_min(val) -> float | None:
+    """Convert 'MM:SS' or plain-minute value to total seconds."""
+    if val in (None, "", "DNP"):
+        return None
+    s = str(val).strip()
+    if ":" in s:
+        try:
+            parts = s.split(":")
+            return float(parts[0]) * 60 + float(parts[1])
+        except ValueError:
+            return None
+    try:
+        return float(s) * 60
+    except (ValueError, TypeError):
+        return None
+
+
+def _opp_from_matchup(matchup: str, team_abbr: str) -> str:
+    """Extract opponent abbreviation from a MATCHUP string like 'SEA vs. NYL' or 'SEA @ NYL'."""
+    if not matchup:
+        return ""
+    parts = matchup.replace(" @ ", " vs. ").split(" vs. ")
+    for part in parts:
+        a = norm(part.strip())
+        if a.upper() != team_abbr.upper():
+            return a
+    return ""
+
+
+def _fetch_player_logs_wnba(player_id: str, season: str, days: int) -> list[dict]:
+    """
+    Fetch a single player's game log from stats.wnba.com/stats/playergamelog.
+    Falls back to the ESPN box-score index on failure.
+    Results filtered to the last `days` days.
+    """
+    cache_key = f"wnba_log_{player_id}_{season}"
+    if (cached := cache_get(cache_key)):
+        logs = cached
+    else:
+        data = _wnba_get(
+            "https://stats.wnba.com/stats/playergamelog",
+            params={
+                "PlayerID":   player_id,
+                "Season":     season,
+                "SeasonType": "Regular Season",
+                "LeagueID":   "10",
+            },
+        )
+        logs: list[dict] = []
+        if data:
+            for row in _wnba_rs(data, "PlayerGameLog"):
+                game_date = _parse_wnba_game_date(str(row.get("GAME_DATE", "")))
+                matchup   = row.get("MATCHUP", "")
+                # First token before "vs." / "@" is the player's team
+                team_abbr = norm(
+                    matchup.replace(" @ ", " vs. ").split(" vs. ")[0].strip()
+                )
+                opp_abbr = _opp_from_matchup(matchup, team_abbr)
+
+                def _n(key):
+                    v = row.get(key)
+                    try:
+                        return float(v) if v is not None else None
+                    except (ValueError, TypeError):
+                        return None
+
+                logs.append({
+                    "season":     int(season) if str(season).isdigit() else 0,
+                    "player_id":  player_id,
+                    "game_date":  game_date,
+                    "team":       team_abbr,
+                    "opponent":   opp_abbr,
+                    "mp_seconds": _parse_wnba_min(row.get("MIN")),
+                    "pts":        _n("PTS"),
+                    "reb":        _n("REB"),
+                    "ast":        _n("AST"),
+                    "three_p":    _n("FG3M"),
+                    "ftm":        _n("FTM"),
+                    "fga":        _n("FGA"),
+                    "fta":        _n("FTA"),
+                    "stl":        _n("STL"),
+                    "blk":        _n("BLK"),
+                    "tov":        _n("TOV"),
+                })
+            logs.sort(key=lambda l: l.get("game_date", ""), reverse=True)
+
+        if not logs:
+            log.warning("stats.wnba.com returned no logs for player %s — falling back to ESPN index", player_id)
+            # Cap ESPN index scan to 90 days — scanning 365 days makes 365+ HTTP
+            # calls and times out on Render. stats.wnba.com is the right source
+            # for deep history; ESPN is only useful for very recent games.
+            espn_days = min(days, 90)
+            idx  = _build_espn_log_index(days=espn_days)
+            logs = idx.get(player_id, [])
+
+        cache_set(cache_key, logs, ttl=1800)
+
+    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+    return [l for l in logs if l.get("game_date", "") >= cutoff]
+
+
+# ── ESPN box-score game-log index (fallback) ───────────────────────────────────
 
 def _sv(stats: list, i, made_only: bool = True):
     """Extract a numeric value from an ESPN stats list. Handles 'made-att' format."""
@@ -558,23 +769,87 @@ def lineups():
 def player_logs():
     """
     Query params:
-      player_id (required) — ESPN athlete ID (same IDs served by /wnba/roster)
-      season    (optional) — 4-digit year, default CURRENT_SEASON (informational label)
-      days      (optional) — window of days to scan, default 60
+      player_id (required) — WNBA/ESPN athlete ID (same IDs served by /wnba/roster)
+      season    (optional) — 4-digit year, default CURRENT_SEASON
+      days      (optional) — window of days to include, default 60
     Response: { player_id, season, logs: [{...}] }
     """
     player_id = request.args.get("player_id", "").strip()
     season    = request.args.get("season", CURRENT_SEASON)
-    days      = int(request.args.get("days", 60))
+    try:
+        days = int(request.args.get("days", 60))
+    except (ValueError, TypeError):
+        days = 60
 
     if not player_id:
         return jsonify({"error": "player_id is required"}), 400
 
-    index  = _build_espn_log_index(days=days)
-    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
-    logs   = [l for l in index.get(player_id, []) if l.get("game_date", "") >= cutoff]
+    try:
+        logs = _fetch_player_logs_wnba(player_id, season, days)
+    except Exception as exc:
+        log.exception("player_logs failed for player_id=%s: %s", player_id, exc)
+        return jsonify({"player_id": player_id, "season": season, "logs": []}), 200
 
-    return jsonify({"player_id": player_id, "season": int(season), "logs": logs})
+    return jsonify({"player_id": player_id, "season": int(season) if str(season).isdigit() else season, "logs": logs})
+
+
+# ── /wnba/player_logs_bulk ─────────────────────────────────────────────────────
+@app.route("/wnba/player_logs_bulk")
+def player_logs_bulk():
+    """
+    Fetches game logs for multiple players in a single request.
+
+    Query params:
+      player_ids (required) — comma-separated list of player IDs
+      season     (optional) — 4-digit year, default CURRENT_SEASON
+      days       (optional) — window of days to include, default 60
+
+    Response: { season, logs_by_player: { player_id: [{...}], ... } }
+
+    Strategy:
+      1. Build the ESPN log index once (scans all box scores in batch, cached 30 min).
+         This covers every player who appeared in a game — no per-player requests.
+      2. For any requested player not found in the index, fall back to a
+         stats.wnba.com/playergamelog call (one per missing player, rare case).
+    """
+    ids_raw = request.args.get("player_ids", "").strip()
+    if not ids_raw:
+        return jsonify({"error": "player_ids is required"}), 400
+
+    season = request.args.get("season", CURRENT_SEASON)
+    days   = int(request.args.get("days", 60))
+
+    # Cap to a reasonable number to prevent abuse
+    player_ids = [p.strip() for p in ids_raw.split(",") if p.strip()][:150]
+
+    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # 1. ESPN log index (batch, cached)
+    index = _build_espn_log_index(days=days)
+
+    logs_by_player: dict[str, list] = {}
+    missing_ids: list[str] = []
+
+    for pid in player_ids:
+        entries = [l for l in index.get(pid, []) if l.get("game_date", "") >= cutoff]
+        if entries:
+            logs_by_player[pid] = entries
+        else:
+            missing_ids.append(pid)
+
+    # 2. Fall back to stats.wnba.com for players not in the ESPN index
+    for pid in missing_ids:
+        logs = _fetch_player_logs_wnba(pid, season, days)
+        logs_by_player[pid] = logs
+
+    log.info(
+        "player_logs_bulk: %d requested, %d from ESPN index, %d from wnba fallback",
+        len(player_ids), len(player_ids) - len(missing_ids), len(missing_ids),
+    )
+    return jsonify({
+        "season":         int(season) if str(season).isdigit() else season,
+        "logs_by_player": logs_by_player,
+    })
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
