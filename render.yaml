@@ -1,11 +1,11 @@
 services:
   - type: web
     name: wnba-stats
-    env: python
+    env: docker
+    dockerfilePath: ./server/Dockerfile
+    dockerContext: ./server
     region: oregon
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 --preload
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0

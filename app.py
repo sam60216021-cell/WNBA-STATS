@@ -15,8 +15,11 @@ Endpoints:
 """
 
 import os
+import sqlite3
+import threading
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -397,6 +400,239 @@ def _fetch_all_players(season: str = CURRENT_SEASON) -> list[dict]:
 
     log.warning("Both ESPN and stats.wnba.com returned no players")
     return []
+
+
+# ── SQLite game-log database ──────────────────────────────────────────────────
+# Stored in /tmp — always available on Render, even the free tier.
+# The filesystem is ephemeral (wiped on every deploy/restart), so the
+# background scraper repopulates it automatically on every cold start.
+
+DB_PATH = "/tmp/wnba_logs.db"
+_db_write_lock = threading.Lock()
+
+
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _init_db() -> None:
+    with _db_write_lock, _db_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS game_logs (
+                log_id      TEXT PRIMARY KEY,
+                player_id   TEXT NOT NULL,
+                game_date   TEXT NOT NULL,
+                season      INTEGER,
+                team        TEXT,
+                opponent    TEXT,
+                mp_seconds  REAL,
+                pts         REAL,
+                reb         REAL,
+                ast         REAL,
+                three_p     REAL,
+                ftm         REAL,
+                fga         REAL,
+                fta         REAL,
+                stl         REAL,
+                blk         REAL,
+                tov         REAL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gl_pid_date "
+            "ON game_logs(player_id, game_date)"
+        )
+        conn.commit()
+    log.info("DB initialised — %s", DB_PATH)
+
+
+def _db_upsert_logs(logs: list[dict]) -> int:
+    """Insert-or-replace game log dicts. Returns number of rows written."""
+    rows = []
+    for entry in logs:
+        pid   = entry.get("player_id", "")
+        gdate = entry.get("game_date", "")
+        if not pid or not gdate:
+            continue
+        rows.append((
+            f"{pid}_{gdate}",
+            pid, gdate,
+            entry.get("season"), entry.get("team"), entry.get("opponent"),
+            entry.get("mp_seconds"), entry.get("pts"), entry.get("reb"),
+            entry.get("ast"), entry.get("three_p"), entry.get("ftm"),
+            entry.get("fga"), entry.get("fta"), entry.get("stl"),
+            entry.get("blk"), entry.get("tov"),
+        ))
+    if not rows:
+        return 0
+    with _db_write_lock, _db_conn() as conn:
+        conn.executemany(
+            """INSERT OR REPLACE INTO game_logs
+               (log_id, player_id, game_date, season, team, opponent,
+                mp_seconds, pts, reb, ast, three_p, ftm, fga, fta, stl, blk, tov)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            rows,
+        )
+        conn.commit()
+    return len(rows)
+
+
+def _db_query_logs(player_ids: list[str], cutoff: str) -> dict[str, list[dict]]:
+    """Return {player_id: [log_dict, ...]} for all rows with game_date >= cutoff."""
+    if not player_ids:
+        return {}
+    ph = ",".join("?" * len(player_ids))
+    with _db_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM game_logs "
+            f"WHERE player_id IN ({ph}) AND game_date >= ? "
+            f"ORDER BY game_date DESC",
+            player_ids + [cutoff],
+        ).fetchall()
+    result: dict[str, list] = {}
+    for row in rows:
+        pid = row["player_id"]
+        result.setdefault(pid, []).append({
+            "season":     row["season"],
+            "player_id":  pid,
+            "game_date":  row["game_date"],
+            "team":       row["team"],
+            "opponent":   row["opponent"],
+            "mp_seconds": row["mp_seconds"],
+            "pts":        row["pts"],
+            "reb":        row["reb"],
+            "ast":        row["ast"],
+            "three_p":    row["three_p"],
+            "ftm":        row["ftm"],
+            "fga":        row["fga"],
+            "fta":        row["fta"],
+            "stl":        row["stl"],
+            "blk":        row["blk"],
+            "tov":        row["tov"],
+        })
+    return result
+
+
+def _db_row_count() -> int:
+    with _db_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM game_logs").fetchone()[0]
+
+
+# ── Parallel ESPN scraper ─────────────────────────────────────────────────────
+
+def _scrape_date_range(days: int = 90) -> int:
+    """
+    Fetch ESPN box scores for every completed/live WNBA game in the last
+    `days` days and upsert them into the SQLite DB.
+
+    Uses two parallel pools:
+      - 10 workers to fetch scoreboard pages (one per calendar day)
+      - 8 workers to fetch individual game box scores
+
+    Returns the total number of log rows upserted.
+    """
+    today_dt = datetime.now(ET)
+
+    # ── 1. Collect event IDs (parallel) ──────────────────────────────────────
+    def _fetch_day_events(delta: int) -> list[tuple[str, str]]:
+        day = today_dt - timedelta(days=delta)
+        ds  = day.strftime("%Y%m%d")
+        iso = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
+        try:
+            r = espn.get(
+                "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
+                params={"dates": ds},
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return []
+        return [
+            (e.get("id", ""), iso)
+            for e in data.get("events", [])
+            if e.get("status", {}).get("type", {}).get("state", "") in ("in", "post")
+            and e.get("id")
+        ]
+
+    event_ids: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for result in as_completed(
+            [pool.submit(_fetch_day_events, d) for d in range(days)]
+        ):
+            event_ids.extend(result.result())
+
+    log.info("Scraper: %d completed/live events over last %d days", len(event_ids), days)
+
+    # ── 2. Fetch box scores + extract player logs (parallel) ─────────────────
+    def _fetch_box(event_id: str, game_date: str) -> list[dict]:
+        try:
+            r = espn.get(
+                "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
+                params={"event": event_id},
+                timeout=12,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            log.debug("Box score %s failed: %s", event_id, exc)
+            return []
+        idx: dict[str, list] = {}
+        _extract_boxscore(data, game_date, CURRENT_SEASON, idx)
+        return [row for rows in idx.values() for row in rows]
+
+    all_logs: list[dict] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(_fetch_box, eid, gdate): (eid, gdate)
+            for eid, gdate in event_ids
+        }
+        for future in as_completed(futures):
+            all_logs.extend(future.result())
+
+    n = _db_upsert_logs(all_logs)
+    log.info("Scraper: upserted %d rows from %d events", n, len(event_ids))
+    return n
+
+
+_scrape_lock  = threading.Lock()
+_scrape_ready = threading.Event()   # set after the initial 90-day scrape
+
+
+def _background_scraper() -> None:
+    """
+    Background daemon thread.
+    • On cold start: scrapes the last 90 days (covers the full current season).
+    • Every 20 minutes after that: re-scrapes the last 3 days to pick up
+      any games that finished or went live since the last run.
+    """
+    if _scrape_lock.acquire(blocking=False):
+        try:
+            log.info("Background scraper: initial 90-day scrape starting…")
+            _scrape_date_range(days=90)
+            log.info(
+                "Background scraper: initial scrape done — %d rows in DB",
+                _db_row_count(),
+            )
+        except Exception as exc:
+            log.warning("Background scraper: initial scrape failed: %s", exc)
+        finally:
+            _scrape_ready.set()
+            _scrape_lock.release()
+
+    while True:
+        time.sleep(1200)  # 20-minute refresh interval
+        if _scrape_lock.acquire(blocking=False):
+            try:
+                _scrape_date_range(days=3)
+            except Exception as exc:
+                log.warning("Background scraper: incremental scrape failed: %s", exc)
+            finally:
+                _scrape_lock.release()
 
 
 # ── stats.wnba.com player game logs ───────────────────────────────────────────
@@ -784,13 +1020,33 @@ def player_logs():
     if not player_id:
         return jsonify({"error": "player_id is required"}), 400
 
+    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # 1. Query the local DB (instant — populated by background scraper)
+    db_result = _db_query_logs([player_id], cutoff)
+    if player_id in db_result:
+        logs = db_result[player_id]
+        return jsonify({
+            "player_id": player_id,
+            "season":    int(season) if str(season).isdigit() else season,
+            "logs":      logs,
+        })
+
+    # 2. DB empty (e.g. server just restarted) — fall back to live fetch
     try:
         logs = _fetch_player_logs_wnba(player_id, season, days)
     except Exception as exc:
-        log.exception("player_logs failed for player_id=%s: %s", player_id, exc)
+        log.exception("player_logs fallback failed for %s: %s", player_id, exc)
         return jsonify({"player_id": player_id, "season": season, "logs": []}), 200
 
-    return jsonify({"player_id": player_id, "season": int(season) if str(season).isdigit() else season, "logs": logs})
+    if logs:
+        _db_upsert_logs(logs)   # warm the DB for next time
+
+    return jsonify({
+        "player_id": player_id,
+        "season":    int(season) if str(season).isdigit() else season,
+        "logs":      logs,
+    })
 
 
 # ── /wnba/player_logs_bulk ─────────────────────────────────────────────────────
@@ -807,43 +1063,61 @@ def player_logs_bulk():
     Response: { season, logs_by_player: { player_id: [{...}], ... } }
 
     Strategy:
-      1. Build the ESPN log index once (scans all box scores in batch, cached 30 min).
-         This covers every player who appeared in a game — no per-player requests.
-      2. For any requested player not found in the index, fall back to a
-         stats.wnba.com/playergamelog call (one per missing player, rare case).
+      1. Query the SQLite DB (built and refreshed by the background scraper).
+         This is instant and covers all players in all recent games.
+      2. For any player not found in the DB (DB still warming up after cold start),
+         try the ESPN log index (capped at 90 days to prevent Render timeout).
+      3. Last resort: stats.wnba.com per-player fallback.
     """
     ids_raw = request.args.get("player_ids", "").strip()
     if not ids_raw:
         return jsonify({"error": "player_ids is required"}), 400
 
     season = request.args.get("season", CURRENT_SEASON)
-    days   = int(request.args.get("days", 60))
+    try:
+        days = int(request.args.get("days", 60))
+    except (ValueError, TypeError):
+        days = 60
 
     # Cap to a reasonable number to prevent abuse
     player_ids = [p.strip() for p in ids_raw.split(",") if p.strip()][:150]
-
     cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    # 1. ESPN log index (batch, cached)
-    index = _build_espn_log_index(days=days)
+    # 1. SQLite DB query (instant)
+    logs_by_player = _db_query_logs(player_ids, cutoff)
+    missing_ids    = [pid for pid in player_ids if pid not in logs_by_player]
 
-    logs_by_player: dict[str, list] = {}
-    missing_ids: list[str] = []
+    # 2. ESPN log index for players missing from the DB.
+    # When the DB is cold (all players missing + background scraper not done),
+    # cap to 20 days so the index build completes in ~5-15 s and stays within
+    # Render's free-tier response timeout.  20 days always covers the entire
+    # current WNBA season (which starts in early May).
+    # Once the background scraper has finished its initial 90-day pass, missing_ids
+    # is empty (or tiny) and this block is skipped entirely.
+    if missing_ids:
+        db_is_cold = (
+            len(missing_ids) == len(player_ids) and not _scrape_ready.is_set()
+        )
+        espn_days = 20 if db_is_cold else min(days, 90)
+        index     = _build_espn_log_index(days=espn_days)
+        still_missing: list[str] = []
+        for pid in missing_ids:
+            entries = [l for l in index.get(pid, []) if l.get("game_date", "") >= cutoff]
+            if entries:
+                logs_by_player[pid] = entries
+                _db_upsert_logs(entries)   # cache for next time
+            else:
+                still_missing.append(pid)
 
-    for pid in player_ids:
-        entries = [l for l in index.get(pid, []) if l.get("game_date", "") >= cutoff]
-        if entries:
-            logs_by_player[pid] = entries
-        else:
-            missing_ids.append(pid)
-
-    # 2. Fall back to stats.wnba.com for players not in the ESPN index
-    for pid in missing_ids:
-        logs = _fetch_player_logs_wnba(pid, season, days)
-        logs_by_player[pid] = logs
+        # 3. stats.wnba.com per-player fallback (last resort)
+        for pid in still_missing:
+            fb_logs = _fetch_player_logs_wnba(pid, season, days)
+            logs_by_player[pid] = fb_logs
+            if fb_logs:
+                _db_upsert_logs(fb_logs)
 
     log.info(
-        "player_logs_bulk: %d requested, %d from ESPN index, %d from wnba fallback",
+        "player_logs_bulk: %d requested, %d from DB, %d needed fallback",
         len(player_ids), len(player_ids) - len(missing_ids), len(missing_ids),
     )
     return jsonify({
@@ -852,7 +1126,40 @@ def player_logs_bulk():
     })
 
 
+
+# ── /wnba/scrape ───────────────────────────────────────────────────────────────
+@app.route("/wnba/scrape")
+def scrape():
+    """
+    Manually trigger a scrape of recent WNBA game logs.
+    Query params:
+      days (optional) — how many days to scrape, default 7, max 90
+    Response: { status, rows_upserted, total_rows }
+    """
+    try:
+        days = min(int(request.args.get("days", 7)), 90)
+    except (ValueError, TypeError):
+        days = 7
+
+    if not _scrape_lock.acquire(blocking=False):
+        return jsonify({"status": "busy", "message": "Scrape already in progress"}), 202
+
+    try:
+        n = _scrape_date_range(days=days)
+        return jsonify({"status": "ok", "rows_upserted": n, "total_rows": _db_row_count()})
+    except Exception as exc:
+        log.exception("Manual scrape failed: %s", exc)
+        return jsonify({"status": "error", "error": str(exc)}), 500
+    finally:
+        _scrape_lock.release()
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
+# Initialise the SQLite DB and launch the background scraper before serving
+# any requests.  Both are safe to call from the module-level on Render.
+_init_db()
+threading.Thread(target=_background_scraper, daemon=True, name="bg-scraper").start()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port, debug=False)
