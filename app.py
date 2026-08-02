@@ -94,6 +94,30 @@ def norm(abbr: str) -> str:
     a = (abbr or "").upper().strip()
     return _ESPN_MAP.get(a, a)
 
+
+def _team_id_abbr_map(season: str = CURRENT_SEASON) -> dict[str, str]:
+    """Build TEAM_ID -> team abbreviation map from stats.wnba.com."""
+    cache_key = f"wnba_team_id_abbr_{season}"
+    if (cached := cache_get(cache_key)):
+        return cached
+
+    out: dict[str, str] = {}
+    data = _wnba_get(
+        "https://stats.wnba.com/stats/commonteamyears",
+        params={"LeagueID": "10"},
+        cache_key="wnba_team_ids",
+        ttl=86400,
+    )
+    if data:
+        for row in _wnba_rs(data, "TeamYears"):
+            if str(row.get("MAX_YEAR", "")) >= season:
+                tid = str(row.get("TEAM_ID", ""))
+                abbr = norm(row.get("ABBREVIATION", ""))
+                if tid and abbr:
+                    out[tid] = abbr
+    cache_set(cache_key, out, ttl=86400)
+    return out
+
 # ── stats.wnba.com JSON helpers ────────────────────────────────────────────────
 
 def _wnba_rs(data: dict, name: str) -> list[dict]:
@@ -265,6 +289,204 @@ def standings():
 
     result = {"standings": entries}
     cache_set("standings", result, ttl=600)
+    return jsonify(result)
+
+
+# ── /wnba/team_advanced ───────────────────────────────────────────────────────
+@app.route("/wnba/team_advanced")
+def team_advanced():
+    """
+    Returns team-level advanced metrics for matchup context.
+    Source: stats.wnba.com leaguedashteamstats (MeasureType=Advanced, PerMode=PerGame)
+    """
+    season = request.args.get("season", CURRENT_SEASON)
+    cache_key = f"team_advanced_{season}"
+    if (cached := cache_get(cache_key)):
+        return jsonify(cached)
+
+    data = _wnba_get(
+        "https://stats.wnba.com/stats/leaguedashteamstats",
+        params={
+            "LeagueID": "10",
+            "Season": season,
+            "SeasonType": "Regular Season",
+            "PerMode": "PerGame",
+            "MeasureType": "Advanced",
+        },
+        cache_key=f"team_advanced_raw_{season}",
+        ttl=1800,
+    )
+
+    if not data:
+        return jsonify({"season": int(season) if str(season).isdigit() else season, "teams": []})
+
+    id_to_abbr = _team_id_abbr_map(season)
+
+    def _n(row: dict, *keys):
+        for k in keys:
+            if k in row and row.get(k) is not None:
+                try:
+                    return float(row.get(k))
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    rows = []
+    for row in _wnba_rs(data, "LeagueDashTeamStats"):
+        tid = str(row.get("TEAM_ID", ""))
+        abbr = norm(row.get("TEAM_ABBREVIATION", "")) or id_to_abbr.get(tid, "")
+        if not abbr:
+            continue
+        rows.append({
+            "team_abbreviation": abbr,
+            "pace": _n(row, "PACE"),
+            "off_rating": _n(row, "OFF_RATING", "OFFRTG"),
+            "def_rating": _n(row, "DEF_RATING", "DEFRTG"),
+            "net_rating": _n(row, "NET_RATING", "NETRTG"),
+            "ts_pct": _n(row, "TS_PCT"),
+            "efg_pct": _n(row, "EFG_PCT"),
+            "tov_pct": _n(row, "TOV_PCT"),
+            "reb_pct": _n(row, "REB_PCT"),
+            "ast_ratio": _n(row, "AST_RATIO"),
+        })
+
+    result = {
+        "season": int(season) if str(season).isdigit() else season,
+        "teams": rows,
+    }
+    cache_set(cache_key, result, ttl=1800)
+    return jsonify(result)
+
+
+# ── /wnba/team_position_splits ───────────────────────────────────────────────
+@app.route("/wnba/team_position_splits")
+def team_position_splits():
+    """
+    Returns defensive allowed-stat splits by offensive position bucket.
+    Source: local game_logs DB + roster position map.
+    """
+    season = request.args.get("season", CURRENT_SEASON)
+    try:
+        days = int(request.args.get("days", 120))
+    except (ValueError, TypeError):
+        days = 120
+    days = max(30, min(days, 365))
+
+    cache_key = f"team_pos_splits_{season}_{days}"
+    if (cached := cache_get(cache_key)):
+        return jsonify(cached)
+
+    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    players = _fetch_all_players(season)
+    pos_by_pid: dict[str, str] = {
+        str(p.get("player_id", "")): (p.get("pos", "") or "")
+        for p in players if p.get("player_id")
+    }
+
+    def pos_group(raw_pos: str) -> str:
+        s = (raw_pos or "").upper()
+        if "G" in s:
+            return "GUARD"
+        if "C" in s and "F" not in s:
+            return "BIG"
+        if "F" in s:
+            return "WING"
+        return "WING"
+
+    conn = _db_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT player_id, opponent, pts, reb, ast, three_p, stl, blk
+            FROM game_logs
+            WHERE game_date >= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    agg: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        opp = norm(row["opponent"] or "")
+        pid = str(row["player_id"] or "")
+        if not opp or not pid:
+            continue
+
+        group = pos_group(pos_by_pid.get(pid, ""))
+        key = (opp, group)
+        bucket = agg.setdefault(key, {
+            "count": 0,
+            "pts": 0.0,
+            "reb": 0.0,
+            "ast": 0.0,
+            "three_p": 0.0,
+            "stl": 0.0,
+            "blk": 0.0,
+            "pra": 0.0,
+            "n_pts": 0,
+            "n_reb": 0,
+            "n_ast": 0,
+            "n_three_p": 0,
+            "n_stl": 0,
+            "n_blk": 0,
+            "n_pra": 0,
+        })
+
+        def add(stat_key: str, value):
+            if value is None:
+                return
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                return
+            bucket[stat_key] += v
+            bucket[f"n_{stat_key}"] += 1
+
+        pts = row["pts"]
+        reb = row["reb"]
+        ast = row["ast"]
+        add("pts", pts)
+        add("reb", reb)
+        add("ast", ast)
+        add("three_p", row["three_p"])
+        add("stl", row["stl"])
+        add("blk", row["blk"])
+        if pts is not None and reb is not None and ast is not None:
+            add("pra", float(pts) + float(reb) + float(ast))
+
+        bucket["count"] += 1
+
+    def avg(total_key: str, n_key: str, bucket: dict):
+        n = bucket.get(n_key, 0)
+        if n <= 0:
+            return None
+        return bucket.get(total_key, 0.0) / n
+
+    out = []
+    for (team_abbr, group), bucket in agg.items():
+        if bucket["count"] < 20:
+            continue
+        out.append({
+            "team_abbreviation": team_abbr,
+            "position_group": group,
+            "pts_allowed": avg("pts", "n_pts", bucket),
+            "reb_allowed": avg("reb", "n_reb", bucket),
+            "ast_allowed": avg("ast", "n_ast", bucket),
+            "threepm_allowed": avg("three_p", "n_three_p", bucket),
+            "stl_allowed": avg("stl", "n_stl", bucket),
+            "blk_allowed": avg("blk", "n_blk", bucket),
+            "pra_allowed": avg("pra", "n_pra", bucket),
+            "sample_size": int(bucket["count"]),
+        })
+
+    result = {
+        "season": int(season) if str(season).isdigit() else season,
+        "days": days,
+        "splits": out,
+    }
+    cache_set(cache_key, result, ttl=1800)
     return jsonify(result)
 
 # ── Player roster ──────────────────────────────────────────────────────────────
