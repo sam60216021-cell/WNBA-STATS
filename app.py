@@ -1355,7 +1355,9 @@ def player_logs_bulk():
                         len(still_missing),
                     )
                 else:
-                    max_fallback = int(os.environ.get("WNBA_BULK_FALLBACK_MAX", "4"))
+                    # Default to 0 so bulk endpoints stay fast and never block
+                    # on slow upstream per-player fallbacks unless explicitly enabled.
+                    max_fallback = int(os.environ.get("WNBA_BULK_FALLBACK_MAX", "0"))
                     limited_ids = still_missing[:max_fallback]
                     skipped_ids = still_missing[max_fallback:]
 
