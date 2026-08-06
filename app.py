@@ -89,6 +89,11 @@ SEED_LOG_CANDIDATES = [
     os.path.join(os.path.dirname(__file__), "StarterLogs.json"),
     os.path.join(os.path.dirname(__file__), "..", "Shattered Backboard WNBA Stats", "StarterLogs.json"),
 ]
+SEED_LOGS_URL = os.environ.get(
+    "WNBA_STARTER_LOGS_URL",
+    "https://raw.githubusercontent.com/sam60216021-cell/WNBA-STATS/main/Shattered%20Backboard%20WNBA%20Stats/StarterLogs.json",
+).strip()
+DOWNLOADED_SEED_PATH = "/tmp/StarterLogs.seed.json"
 
 # ESPN uses 2-letter / truncated abbreviations for some teams; normalise to 3-letter standard
 _ESPN_MAP = {
@@ -783,6 +788,19 @@ def _seed_logs_path() -> str | None:
     for path in SEED_LOG_CANDIDATES:
         if path and os.path.exists(path):
             return path
+    # Render may deploy only ./server (rootDir=server), so the iOS bundle file
+    # may not be present on disk. Fall back to downloading from GitHub raw.
+    if SEED_LOGS_URL:
+        try:
+            r = requests.get(SEED_LOGS_URL, timeout=20)
+            r.raise_for_status()
+            with open(DOWNLOADED_SEED_PATH, "wb") as f:
+                f.write(r.content)
+            if os.path.exists(DOWNLOADED_SEED_PATH):
+                log.info("Seed download: saved %d bytes from %s", len(r.content), SEED_LOGS_URL)
+                return DOWNLOADED_SEED_PATH
+        except Exception as exc:
+            log.warning("Seed download failed from %s: %s", SEED_LOGS_URL, exc)
     return None
 
 
