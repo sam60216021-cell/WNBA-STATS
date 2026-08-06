@@ -917,6 +917,7 @@ def _fetch_player_logs_wnba(
     season: str,
     days: int,
     use_espn_fallback: bool = True,
+    source_timeout: int = 5,
 ) -> list[dict]:
     """
     Fetch a single player's game log from stats.wnba.com/stats/playergamelog.
@@ -936,7 +937,7 @@ def _fetch_player_logs_wnba(
                 "SeasonType": "Regular Season",
                 "LeagueID":   "10",
             },
-            timeout=5,
+            timeout=source_timeout,
         )
         logs: list[dict] = []
         if data:
@@ -1320,40 +1321,77 @@ def player_logs_bulk():
     player_ids = [p.strip() for p in ids_raw.split(",") if p.strip()][:150]
     cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    # 1. SQLite DB query (instant)
-    logs_by_player = _db_query_logs(player_ids, cutoff)
-    missing_ids    = [pid for pid in player_ids if pid not in logs_by_player]
+    try:
+        # 1. SQLite DB query (instant)
+        logs_by_player = _db_query_logs(player_ids, cutoff)
+        missing_ids    = [pid for pid in player_ids if pid not in logs_by_player]
 
-    # 2. ESPN log index for players missing from the DB.
-    # When the DB is cold (all players missing + background scraper not done),
-    # cap to 20 days so the index build completes in ~5-15 s and stays within
-    # Render's free-tier response timeout.  20 days always covers the entire
-    # current WNBA season (which starts in early May).
-    # Once the background scraper has finished its initial 90-day pass, missing_ids
-    # is empty (or tiny) and this block is skipped entirely.
-    if missing_ids:
-        db_is_cold = (
-            len(missing_ids) == len(player_ids) and not _scrape_ready.is_set()
-        )
-        espn_days = 20 if db_is_cold else min(days, 90)
-        index     = _build_espn_log_index(days=espn_days)
-        still_missing: list[str] = []
+        # 2. ESPN log index for players missing from the DB.
+        if missing_ids:
+            db_is_cold = (
+                len(missing_ids) == len(player_ids) and not _scrape_ready.is_set()
+            )
+            espn_days = 20 if db_is_cold else min(days, 90)
+            index     = _build_espn_log_index(days=espn_days)
+            still_missing: list[str] = []
+            for pid in missing_ids:
+                entries = [l for l in index.get(pid, []) if l.get("game_date", "") >= cutoff]
+                if entries:
+                    logs_by_player[pid] = entries
+                    _db_upsert_logs(entries)   # cache for next time
+                else:
+                    still_missing.append(pid)
+
+            # 3. stats.wnba.com per-player fallback (last resort)
+            # During cold-start/high-latency windows this can exceed Gunicorn timeout.
+            # Keep this bounded so API stays responsive and returns partial results.
+            if still_missing:
+                if db_is_cold:
+                    for pid in still_missing:
+                        logs_by_player[pid] = []
+                    log.warning(
+                        "player_logs_bulk: DB cold + %d players still missing after ESPN index; "
+                        "skipping deep fallback to avoid request timeout",
+                        len(still_missing),
+                    )
+                else:
+                    max_fallback = int(os.environ.get("WNBA_BULK_FALLBACK_MAX", "4"))
+                    limited_ids = still_missing[:max_fallback]
+                    skipped_ids = still_missing[max_fallback:]
+
+                    for pid in skipped_ids:
+                        logs_by_player[pid] = []
+
+                    if limited_ids:
+                        with ThreadPoolExecutor(max_workers=min(4, len(limited_ids))) as ex:
+                            futures = {
+                                ex.submit(
+                                    _fetch_player_logs_wnba,
+                                    pid,
+                                    season,
+                                    min(days, 45),
+                                    False,
+                                    3,
+                                ): pid
+                                for pid in limited_ids
+                            }
+                            for fut in as_completed(futures):
+                                pid = futures[fut]
+                                try:
+                                    fb_logs = fut.result()
+                                except Exception as exc:
+                                    log.warning("bulk fallback failed for %s: %s", pid, exc)
+                                    fb_logs = []
+                                logs_by_player[pid] = fb_logs
+                                if fb_logs:
+                                    _db_upsert_logs(fb_logs)
+    except Exception as exc:
+        log.exception("player_logs_bulk unexpected failure: %s", exc)
+        # Never fail the whole bulk request; return best-effort data.
+        logs_by_player = locals().get("logs_by_player", {}) or {}
+        missing_ids = [pid for pid in player_ids if pid not in logs_by_player]
         for pid in missing_ids:
-            entries = [l for l in index.get(pid, []) if l.get("game_date", "") >= cutoff]
-            if entries:
-                logs_by_player[pid] = entries
-                _db_upsert_logs(entries)   # cache for next time
-            else:
-                still_missing.append(pid)
-
-        # 3. stats.wnba.com per-player fallback (last resort)
-        for pid in still_missing:
-            # ESPN index was already attempted just above; skip it here to
-            # avoid redundant rescans per-player during large bulk requests.
-            fb_logs = _fetch_player_logs_wnba(pid, season, days, use_espn_fallback=False)
-            logs_by_player[pid] = fb_logs
-            if fb_logs:
-                _db_upsert_logs(fb_logs)
+            logs_by_player[pid] = []
 
     log.info(
         "player_logs_bulk: %d requested, %d from DB, %d needed fallback",
