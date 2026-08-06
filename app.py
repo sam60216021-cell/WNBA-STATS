@@ -1410,8 +1410,18 @@ def player_logs_bulk():
             db_is_cold = (
                 len(missing_ids) == len(player_ids) and not _scrape_ready.is_set()
             )
-            espn_days = 20 if db_is_cold else min(days, 90)
-            index     = _build_espn_log_index(days=espn_days)
+            # Building the ESPN index can be expensive (one scoreboard call per day).
+            # When only a small subset of players is missing, skip that scan and go
+            # straight to bounded per-player fallback to avoid worker timeout spikes.
+            miss_ratio = len(missing_ids) / max(1, len(player_ids))
+            use_espn_index = db_is_cold or miss_ratio >= 0.30
+
+            if use_espn_index:
+                espn_days = 20 if db_is_cold else min(days, 20)
+                index = _build_espn_log_index(days=espn_days)
+            else:
+                index = {}
+
             still_missing: list[str] = []
             for pid in missing_ids:
                 entries = [l for l in index.get(pid, []) if l.get("game_date", "") >= cutoff]
