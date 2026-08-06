@@ -59,6 +59,8 @@ espn.headers.update({
     "Accept":     "application/json",
     "User-Agent": "Mozilla/5.0 (compatible; WNBA-Stats-Server/1.0)",
 })
+# Avoid env/netrc auth resolution overhead and occasional import-lock stalls.
+espn.trust_env = False
 
 # stats.wnba.com — requires these headers to avoid 403
 wnba_stats = requests.Session()
@@ -75,6 +77,8 @@ wnba_stats.headers.update({
         "Chrome/124.0.0.0 Safari/537.36"
     ),
 })
+# Avoid env/netrc auth resolution overhead and occasional import-lock stalls.
+wnba_stats.trust_env = False
 
 # ── WNBA constants ─────────────────────────────────────────────────────────────
 CURRENT_SEASON = os.environ.get("WNBA_SEASON", "2026")
@@ -908,7 +912,12 @@ def _opp_from_matchup(matchup: str, team_abbr: str) -> str:
     return ""
 
 
-def _fetch_player_logs_wnba(player_id: str, season: str, days: int) -> list[dict]:
+def _fetch_player_logs_wnba(
+    player_id: str,
+    season: str,
+    days: int,
+    use_espn_fallback: bool = True,
+) -> list[dict]:
     """
     Fetch a single player's game log from stats.wnba.com/stats/playergamelog.
     Falls back to the ESPN box-score index on failure.
@@ -927,7 +936,7 @@ def _fetch_player_logs_wnba(player_id: str, season: str, days: int) -> list[dict
                 "SeasonType": "Regular Season",
                 "LeagueID":   "10",
             },
-            timeout=6,
+            timeout=5,
         )
         logs: list[dict] = []
         if data:
@@ -967,12 +976,12 @@ def _fetch_player_logs_wnba(player_id: str, season: str, days: int) -> list[dict
                 })
             logs.sort(key=lambda l: l.get("game_date", ""), reverse=True)
 
-        if not logs:
+        if not logs and use_espn_fallback:
             log.warning("stats.wnba.com returned no logs for player %s — falling back to ESPN index", player_id)
             # Cap ESPN index scan to 90 days — scanning 365 days makes 365+ HTTP
             # calls and times out on Render. stats.wnba.com is the right source
             # for deep history; ESPN is only useful for very recent games.
-            espn_days = min(days, 90)
+            espn_days = min(days, 20)
             idx  = _build_espn_log_index(days=espn_days)
             logs = idx.get(player_id, [])
 
@@ -1339,7 +1348,9 @@ def player_logs_bulk():
 
         # 3. stats.wnba.com per-player fallback (last resort)
         for pid in still_missing:
-            fb_logs = _fetch_player_logs_wnba(pid, season, days)
+            # ESPN index was already attempted just above; skip it here to
+            # avoid redundant rescans per-player during large bulk requests.
+            fb_logs = _fetch_player_logs_wnba(pid, season, days, use_espn_fallback=False)
             logs_by_player[pid] = fb_logs
             if fb_logs:
                 _db_upsert_logs(fb_logs)
