@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 WNBA Stats Server — Render deployment
 Serves schedule, standings, rosters, player logs, and lineups for the
@@ -129,12 +131,14 @@ def _wnba_rs(data: dict, name: str) -> list[dict]:
     return []
 
 
-def _wnba_get(url: str, params: dict, cache_key: str = "", ttl: int = 3600):
+def _wnba_get(url: str, params: dict, cache_key: str = "", ttl: int = 3600, timeout: int = 15):
     """GET a stats.wnba.com endpoint with optional caching. Returns parsed JSON or None."""
-    if cache_key and (cached := cache_get(cache_key)):
-        return cached
+    if cache_key:
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
     try:
-        r = wnba_stats.get(url, params=params, timeout=15)
+        r = wnba_stats.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         data = r.json()
     except Exception as exc:
@@ -911,7 +915,8 @@ def _fetch_player_logs_wnba(player_id: str, season: str, days: int) -> list[dict
     Results filtered to the last `days` days.
     """
     cache_key = f"wnba_log_{player_id}_{season}"
-    if (cached := cache_get(cache_key)):
+    cached = cache_get(cache_key)
+    if cached is not None:
         logs = cached
     else:
         data = _wnba_get(
@@ -922,6 +927,7 @@ def _fetch_player_logs_wnba(player_id: str, season: str, days: int) -> list[dict
                 "SeasonType": "Regular Season",
                 "LeagueID":   "10",
             },
+            timeout=6,
         )
         logs: list[dict] = []
         if data:
@@ -1346,6 +1352,108 @@ def player_logs_bulk():
         "season":         int(season) if str(season).isdigit() else season,
         "logs_by_player": logs_by_player,
     })
+
+
+# ── /wnba/play_by_play ───────────────────────────────────────────────────────
+@app.route("/wnba/play_by_play")
+def play_by_play():
+    """
+    Query params:
+      game_id (required) — ESPN event ID
+    Response:
+      {
+        game_id,
+        play_by_play: [...],
+        status,
+        source
+      }
+    """
+    game_id = request.args.get("game_id", "").strip()
+    if not game_id:
+        return jsonify({"error": "game_id is required"}), 400
+
+    cache_key = f"pbp_{game_id}"
+    if (cached := cache_get(cache_key)):
+        return jsonify(cached)
+
+    try:
+        r = espn.get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
+            params={"event": game_id},
+            timeout=12,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("play_by_play fetch failed for %s: %s", game_id, exc)
+        return jsonify({
+            "game_id": game_id,
+            "play_by_play": [],
+            "status": "unavailable",
+            "source": "espn_summary",
+        }), 200
+
+    result = {
+        "game_id": game_id,
+        "play_by_play": data.get("drives") or data.get("plays") or [],
+        "status": data.get("header", {}).get("competitions", [{}])[0].get("status", {}),
+        "source": "espn_summary",
+    }
+    cache_set(cache_key, result, ttl=60)
+    return jsonify(result)
+
+
+# ── /wnba/box_score ──────────────────────────────────────────────────────────
+@app.route("/wnba/box_score")
+def box_score():
+    """
+    Query params:
+      game_id (required) — ESPN event ID
+    Response:
+      {
+        game_id,
+        boxscore,
+        players,
+        team_stats,
+        source
+      }
+    """
+    game_id = request.args.get("game_id", "").strip()
+    if not game_id:
+        return jsonify({"error": "game_id is required"}), 400
+
+    cache_key = f"box_{game_id}"
+    if (cached := cache_get(cache_key)):
+        return jsonify(cached)
+
+    try:
+        r = espn.get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
+            params={"event": game_id},
+            timeout=12,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("box_score fetch failed for %s: %s", game_id, exc)
+        return jsonify({
+            "game_id": game_id,
+            "boxscore": {},
+            "players": [],
+            "team_stats": [],
+            "source": "espn_summary",
+        }), 200
+
+    box = data.get("boxscore", {})
+    result = {
+        "game_id": game_id,
+        "boxscore": box,
+        "players": box.get("players", []),
+        "team_stats": box.get("teams", []),
+        "source": "espn_summary",
+    }
+    cache_set(cache_key, result, ttl=60)
+    return jsonify(result)
 
 
 
