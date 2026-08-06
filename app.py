@@ -17,6 +17,7 @@ Endpoints:
 """
 
 import os
+import json
 import sqlite3
 import threading
 import time
@@ -82,6 +83,12 @@ wnba_stats.trust_env = False
 
 # ── WNBA constants ─────────────────────────────────────────────────────────────
 CURRENT_SEASON = os.environ.get("WNBA_SEASON", "2026")
+
+SEED_LOG_CANDIDATES = [
+    os.environ.get("WNBA_STARTER_LOGS_PATH", "").strip(),
+    os.path.join(os.path.dirname(__file__), "StarterLogs.json"),
+    os.path.join(os.path.dirname(__file__), "..", "Shattered Backboard WNBA Stats", "StarterLogs.json"),
+]
 
 # ESPN uses 2-letter / truncated abbreviations for some teams; normalise to 3-letter standard
 _ESPN_MAP = {
@@ -750,6 +757,60 @@ def _db_query_logs(player_ids: list[str], cutoff: str) -> dict[str, list[dict]]:
 def _db_row_count() -> int:
     with _db_conn() as conn:
         return conn.execute("SELECT COUNT(*) FROM game_logs").fetchone()[0]
+
+
+def _db_status() -> dict:
+    with _db_conn() as conn:
+        total_rows = conn.execute("SELECT COUNT(*) FROM game_logs").fetchone()[0]
+        distinct_players = conn.execute(
+            "SELECT COUNT(DISTINCT player_id) FROM game_logs"
+        ).fetchone()[0]
+        latest_game_date = conn.execute(
+            "SELECT MAX(game_date) FROM game_logs"
+        ).fetchone()[0]
+        earliest_game_date = conn.execute(
+            "SELECT MIN(game_date) FROM game_logs"
+        ).fetchone()[0]
+    return {
+        "total_rows": int(total_rows or 0),
+        "distinct_players": int(distinct_players or 0),
+        "latest_game_date": latest_game_date,
+        "earliest_game_date": earliest_game_date,
+    }
+
+
+def _seed_logs_path() -> str | None:
+    for path in SEED_LOG_CANDIDATES:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def _seed_db_from_starter_logs() -> int:
+    """
+    Import bundled StarterLogs.json rows into SQLite for offline/blocked-source fallback.
+    Safe to call on every boot; rows are upserted by (player_id, game_date).
+    """
+    path = _seed_logs_path()
+    if not path:
+        log.warning("Seed import skipped: StarterLogs.json not found")
+        return 0
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        logs = payload.get("logs", []) if isinstance(payload, dict) else []
+    except Exception as exc:
+        log.warning("Seed import failed reading %s: %s", path, exc)
+        return 0
+
+    if not isinstance(logs, list) or not logs:
+        log.warning("Seed import skipped: no logs in %s", path)
+        return 0
+
+    n = _db_upsert_logs(logs)
+    log.info("Seed import: upserted %d rows from %s", n, path)
+    return n
 
 
 # ── Parallel ESPN scraper ─────────────────────────────────────────────────────
@@ -1535,10 +1596,43 @@ def scrape():
         _scrape_lock.release()
 
 
+# ── /wnba/seed_import ─────────────────────────────────────────────────────────
+@app.route("/wnba/seed_import")
+def seed_import():
+    """
+    Manually re-import StarterLogs seed rows into SQLite.
+    Useful when upstream APIs are degraded and DB needs a quick baseline reload.
+    """
+    n = _seed_db_from_starter_logs()
+    return jsonify({
+        "status": "ok",
+        "rows_upserted": n,
+        "total_rows": _db_row_count(),
+    })
+
+
+# ── /wnba/data_status ─────────────────────────────────────────────────────────
+@app.route("/wnba/data_status")
+def data_status():
+    """
+    Returns quick diagnostics for local data availability/freshness.
+    Useful for confirming seed import + scrape/backfill behavior.
+    """
+    status = _db_status()
+    status.update({
+        "season": int(CURRENT_SEASON) if str(CURRENT_SEASON).isdigit() else CURRENT_SEASON,
+        "scrape_ready": _scrape_ready.is_set(),
+        "db_path": DB_PATH,
+    })
+    return jsonify(status)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 # Initialise the SQLite DB and launch the background scraper before serving
 # any requests.  Both are safe to call from the module-level on Render.
 _init_db()
+if _db_row_count() == 0:
+    _seed_db_from_starter_logs()
 threading.Thread(target=_background_scraper, daemon=True, name="bg-scraper").start()
 
 if __name__ == "__main__":
