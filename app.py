@@ -1194,7 +1194,7 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
     today_dt = datetime.now(ET)
     event_ids: list[tuple[str, str]] = []   # (event_id, game_date_iso)
 
-    for delta in range(days):
+    def _fetch_day(delta: int) -> list[tuple[str, str]]:
         day = today_dt - timedelta(days=delta)
         ds  = day.strftime("%Y%m%d")
         iso = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
@@ -1207,16 +1207,26 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
             r.raise_for_status()
             data = r.json()
         except Exception:
-            continue
-        for event in data.get("events", []):
-            state = event.get("status", {}).get("type", {}).get("state", "")
-            if state in ("in", "post"):
-                event_ids.append((event.get("id", ""), iso))
+            return []
+        return [
+            (e.get("id", ""), iso)
+            for e in data.get("events", [])
+            if e.get("status", {}).get("type", {}).get("state", "") in ("in", "post")
+            and e.get("id")
+        ]
 
-    index: dict[str, list] = {}
-    for event_id, game_date in event_ids:
-        if not event_id:
-            continue
+    day_pool = ThreadPoolExecutor(max_workers=10)
+    try:
+        day_futures = [day_pool.submit(_fetch_day, d) for d in range(days)]
+        try:
+            for future in as_completed(day_futures, timeout=60):
+                event_ids.extend(future.result())
+        except TimeoutError:
+            log.warning("ESPN log index: day scan timed out after 60s — using partial results")
+    finally:
+        day_pool.shutdown(wait=False, cancel_futures=True)
+
+    def _fetch_summary(event_id: str, game_date: str) -> tuple[str, dict | None]:
         try:
             r = espn.get(
                 "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
@@ -1224,18 +1234,37 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
                 timeout=10,
             )
             r.raise_for_status()
-            data = r.json()
+            return game_date, r.json()
         except Exception as exc:
             log.debug("Summary %s failed: %s", event_id, exc)
-            continue
-        _extract_boxscore(data, game_date, CURRENT_SEASON, index)
+            return game_date, None
+
+    index: dict[str, list] = {}
+    summary_pool = ThreadPoolExecutor(max_workers=8)
+    try:
+        summary_futures = [
+            summary_pool.submit(_fetch_summary, eid, gdate)
+            for eid, gdate in event_ids if eid
+        ]
+        try:
+            for future in as_completed(summary_futures, timeout=90):
+                game_date, data = future.result()
+                if data:
+                    _extract_boxscore(data, game_date, CURRENT_SEASON, index)
+        except TimeoutError:
+            log.warning("ESPN log index: box-score fetch timed out after 90s — using partial results")
+    finally:
+        summary_pool.shutdown(wait=False, cancel_futures=True)
 
     # Sort each player's logs newest-first
     for pid in index:
         index[pid].sort(key=lambda l: l["game_date"], reverse=True)
 
     log.info("ESPN log index: %d players, %d events scanned", len(index), len(event_ids))
-    cache_set(cache_key, index, ttl=1800)
+    # Only cache non-empty results — an empty index usually means a transient
+    # upstream failure, and caching it would starve the fallback path for 30 min.
+    if index:
+        cache_set(cache_key, index, ttl=1800)
     return index
 
 @app.route("/wnba/stats")
