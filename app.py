@@ -997,13 +997,14 @@ def _fetch_player_logs_wnba(
     days: int,
     use_espn_fallback: bool = True,
     source_timeout: int = 5,
+    start_date: str | None = None,
 ) -> list[dict]:
     """
     Fetch a single player's game log from stats.wnba.com/stats/playergamelog.
     Falls back to the ESPN box-score index on failure.
     Results filtered to the last `days` days.
     """
-    cache_key = f"wnba_log_{player_id}_{season}"
+    cache_key = f"wnba_log_{player_id}_{season}_{start_date or 'recent'}"
     cached = cache_get(cache_key)
     if cached is not None:
         logs = cached
@@ -1067,7 +1068,13 @@ def _fetch_player_logs_wnba(
 
         cache_set(cache_key, logs, ttl=1800)
 
-    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+    if start_date:
+        try:
+            cutoff = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+    else:
+        cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
     return [l for l in logs if l.get("game_date", "") >= cutoff]
 
 
@@ -1325,6 +1332,7 @@ def player_logs():
       player_id (required) — WNBA/ESPN athlete ID (same IDs served by /wnba/roster)
       season    (optional) — 4-digit year, default CURRENT_SEASON
       days      (optional) — window of days to include, default 60
+      start_date(optional) — ISO date to start the window from (e.g. 2026-08-03)
     Response: { player_id, season, logs: [{...}] }
     """
     player_id = request.args.get("player_id", "").strip()
@@ -1333,11 +1341,18 @@ def player_logs():
         days = int(request.args.get("days", 60))
     except (ValueError, TypeError):
         days = 60
+    start_date = request.args.get("start_date", "").strip()
 
     if not player_id:
         return jsonify({"error": "player_id is required"}), 400
 
-    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+    if start_date:
+        try:
+            cutoff = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "start_date must be YYYY-MM-DD"}), 400
+    else:
+        cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
 
     # 1. Query the local DB (instant — populated by background scraper)
     db_result = _db_query_logs([player_id], cutoff)
@@ -1351,7 +1366,7 @@ def player_logs():
 
     # 2. DB empty (e.g. server just restarted) — fall back to live fetch
     try:
-        logs = _fetch_player_logs_wnba(player_id, season, days)
+        logs = _fetch_player_logs_wnba(player_id, season, days, start_date=start_date)
     except Exception as exc:
         log.exception("player_logs fallback failed for %s: %s", player_id, exc)
         return jsonify({"player_id": player_id, "season": season, "logs": []}), 200
@@ -1376,6 +1391,7 @@ def player_logs_bulk():
       player_ids (required) — comma-separated list of player IDs
       season     (optional) — 4-digit year, default CURRENT_SEASON
       days       (optional) — window of days to include, default 60
+      start_date (optional) — ISO date to start the window from (e.g. 2026-08-03)
 
     Response: { season, logs_by_player: { player_id: [{...}], ... } }
 
@@ -1395,10 +1411,18 @@ def player_logs_bulk():
         days = int(request.args.get("days", 60))
     except (ValueError, TypeError):
         days = 60
+    start_date = request.args.get("start_date", "").strip()
 
     # Cap to a reasonable number to prevent abuse
     player_ids = [p.strip() for p in ids_raw.split(",") if p.strip()][:150]
-    cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+    if start_date:
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            cutoff = start_dt.strftime("%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "start_date must be YYYY-MM-DD"}), 400
+    else:
+        cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
 
     try:
         # 1. SQLite DB query (instant)
@@ -1463,6 +1487,7 @@ def player_logs_bulk():
                                     min(days, 45),
                                     False,
                                     3,
+                                    start_date,
                                 ): pid
                                 for pid in limited_ids
                             }
