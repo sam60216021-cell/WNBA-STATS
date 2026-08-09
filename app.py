@@ -843,14 +843,14 @@ def _seed_db_from_starter_logs() -> int:
 
 # ── Parallel ESPN scraper ─────────────────────────────────────────────────────
 
-def _scrape_date_range(days: int = 90) -> int:
+def _scrape_date_range(days: int = 30) -> int:
     """
     Fetch ESPN box scores for every completed/live WNBA game in the last
     `days` days and upsert them into the SQLite DB.
 
-    Uses two parallel pools:
-      - 10 workers to fetch scoreboard pages (one per calendar day)
-      - 8 workers to fetch individual game box scores
+    Uses two modestly-sized worker pools (4 each) so ESPN requests stay spread
+    out rather than firing in one large burst, which cloud-hosting IP ranges
+    are more likely to have rate-limited or filtered.
 
     Returns the total number of log rows upserted.
     """
@@ -869,7 +869,8 @@ def _scrape_date_range(days: int = 90) -> int:
             )
             r.raise_for_status()
             data = r.json()
-        except Exception:
+        except Exception as exc:
+            log.debug("Scoreboard fetch failed for %s: %s", ds, exc)
             return []
         return [
             (e.get("id", ""), iso)
@@ -879,7 +880,7 @@ def _scrape_date_range(days: int = 90) -> int:
         ]
 
     event_ids: list[tuple[str, str]] = []
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         for result in as_completed(
             [pool.submit(_fetch_day_events, d) for d in range(days)]
         ):
@@ -905,7 +906,7 @@ def _scrape_date_range(days: int = 90) -> int:
         return [row for rows in idx.values() for row in rows]
 
     all_logs: list[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {
             pool.submit(_fetch_box, eid, gdate): (eid, gdate)
             for eid, gdate in event_ids
@@ -919,20 +920,21 @@ def _scrape_date_range(days: int = 90) -> int:
 
 
 _scrape_lock  = threading.Lock()
-_scrape_ready = threading.Event()   # set after the initial 90-day scrape
+_scrape_ready = threading.Event()   # set after the initial 30-day scrape
 
 
 def _background_scraper() -> None:
     """
     Background daemon thread.
-    • On cold start: scrapes the last 90 days (covers the full current season).
+    • On cold start: scrapes the last 30 days (bridges the gap since the
+      bundled seed data, without a large burst of ESPN requests).
     • Every 20 minutes after that: re-scrapes the last 3 days to pick up
       any games that finished or went live since the last run.
     """
     if _scrape_lock.acquire(blocking=False):
         try:
-            log.info("Background scraper: initial 90-day scrape starting…")
-            _scrape_date_range(days=90)
+            log.info("Background scraper: initial 30-day scrape starting…")
+            _scrape_date_range(days=30)
             log.info(
                 "Background scraper: initial scrape done — %d rows in DB",
                 _db_row_count(),
@@ -1216,7 +1218,8 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
             )
             r.raise_for_status()
             data = r.json()
-        except Exception:
+        except Exception as exc:
+            log.debug("Scoreboard fetch failed for %s: %s", ds, exc)
             return []
         return [
             (e.get("id", ""), iso)
