@@ -57,8 +57,18 @@ def cache_set(key: str, data, ttl: int = 300):
 # ESPN API — public, no auth required
 espn = requests.Session()
 espn.headers.update({
-    "Accept":     "application/json",
-    "User-Agent": "Mozilla/5.0 (compatible; WNBA-Stats-Server/1.0)",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://www.espn.com/",
+    "Origin":          "https://www.espn.com",
+    # A self-identifying bot User-Agent gets silently filtered by ESPN from
+    # cloud-hosting IP ranges (Render etc.), returning empty results with no
+    # error — mimic a real browser instead.
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
 })
 # Avoid env/netrc auth resolution overhead and occasional import-lock stalls.
 espn.trust_env = False
