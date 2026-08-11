@@ -866,14 +866,81 @@ _br_session.headers.update({
 _br_session.trust_env = False
 
 
-def _br_team_url_abbr(abbr: str) -> str:
-    """Map app team abbreviation to Basketball-Reference URL abbreviation."""
-    return {"LVA": "LVG", "GSV": "GSV", "WSH": "WAS"}.get(abbr, abbr)
+def _normalize_name(name: str) -> str:
+    """Lowercase, strip punctuation — used for fuzzy player name matching."""
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", name)
+    ascii_name = nfkd.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", ascii_name.lower())
+
+
+_br_name_to_espn_id: dict[str, str] = {}   # normalized_name → ESPN player_id
+_br_name_map_built = False
+
+
+def _ensure_br_name_map() -> None:
+    """Build a name → ESPN player_id lookup from the existing game_logs DB rows.
+    Called once lazily so it's populated from the seed data before scraping."""
+    global _br_name_to_espn_id, _br_name_map_built
+    if _br_name_map_built:
+        return
+    # Pull distinct player_id + name from stored game_logs via SQLite directly
+    # The seed data was imported with ESPN IDs so this map is ESPN-ID keyed.
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT player_id, team FROM game_logs"
+            ).fetchall()
+        # We don't store names in game_logs; use the seed file for the mapping.
+        path = _seed_logs_path()
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        for p in payload.get("players", []):
+            pid  = p.get("player_id", "")
+            name = p.get("name", "")
+            if pid and name:
+                _br_name_to_espn_id[_normalize_name(name)] = pid
+        _br_name_map_built = True
+        log.info("BR ID map: loaded %d name→ESPN-ID entries from seed", len(_br_name_to_espn_id))
+    except Exception as exc:
+        log.warning("BR ID map build failed: %s", exc)
+
+
+def _resolve_espn_id(br_id: str, br_name: str) -> str:
+    """Return the ESPN player_id for a BR player, falling back to the BR ID itself."""
+    _ensure_br_name_map()
+    key = _normalize_name(br_name)
+    espn_id = _br_name_to_espn_id.get(key)
+    if espn_id:
+        return espn_id
+    # Try last-name-only match as a fallback (handles minor name differences)
+    parts = key.split()
+    if len(parts) >= 2:
+        last = parts[-1]
+        candidates = [v for k, v in _br_name_to_espn_id.items() if k.endswith(last)]
+        if len(candidates) == 1:
+            return candidates[0]
+    # No match — store under BR ID; new player or name mismatch
+    return br_id
+
+
+def _db_latest_game_date_for_player(player_id: str) -> str | None:
+    """Return the latest game_date in the DB for a given player_id, or None."""
+    try:
+        with _db_conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(game_date) FROM game_logs WHERE player_id = ?",
+                (player_id,)
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 
 def _br_get_team_roster(team_abbr: str, season: int) -> list[tuple[str, str, str]]:
-    """Return list of (br_player_id, name, team_abbr) for a team's current roster.
-    Uses the team season page; data is in HTML comments."""
+    """Return list of (br_player_id, name, team_abbr) for a team's current roster."""
     br_abbr = _br_team_url_abbr(team_abbr)
     url = f"https://www.basketball-reference.com/wnba/teams/{br_abbr}/{season}.html"
     try:
@@ -882,12 +949,10 @@ def _br_get_team_roster(team_abbr: str, season: int) -> list[tuple[str, str, str
     except Exception as exc:
         log.warning("BR roster fetch failed for %s: %s", team_abbr, exc)
         return []
-    # Roster table is hidden in an HTML comment
     text = r.text
-    # Combine main document + comment content so we find either
     combined = text + " ".join(re.findall(r'<!--(.*?)-->', text, re.DOTALL))
     entries = re.findall(
-        r"href='/wnba/players/[a-z]/([^'\"]+)\.html'[^>]*>([^<]+)</a>",
+        r"href=['\"]?/wnba/players/[a-z]/([^'\"]+)\.html['\"]?[^>]*>([^<]+)</a>",
         combined
     )
     seen: dict[str, tuple[str, str, str]] = {}
@@ -898,10 +963,15 @@ def _br_get_team_roster(team_abbr: str, season: int) -> list[tuple[str, str, str
     return list(seen.values())
 
 
-def _br_get_player_logs(br_player_id: str, season: int) -> list[dict]:
+def _br_get_player_logs(br_player_id: str, espn_player_id: str, season: int,
+                        since_date: str | None = None) -> list[dict]:
     """Scrape per-game stats from Basketball-Reference for one player/season.
-    Returns log dicts compatible with _db_upsert_logs."""
-    url = f"https://www.basketball-reference.com/wnba/players/{br_player_id[0]}/{br_player_id}/gamelog/{season}/"
+    Writes logs with espn_player_id so they join the existing DB keyed on ESPN IDs.
+    Only returns rows with game_date > since_date (if provided)."""
+    url = (
+        f"https://www.basketball-reference.com/wnba/players"
+        f"/{br_player_id[0]}/{br_player_id}/gamelog/{season}/"
+    )
     try:
         r = _br_session.get(url, timeout=15)
         r.raise_for_status()
@@ -928,9 +998,10 @@ def _br_get_player_logs(br_player_id: str, season: int) -> list[dict]:
         date = d.get('date_game', '')
         if not date or date == 'Date' or len(date) != 10:
             continue
-        # skip DNP / inactive rows
         if not d.get('pts') and not d.get('mp'):
             continue
+        if since_date and date <= since_date:
+            continue   # already have this row; skip
 
         def _f(key: str):
             try: return float(d[key]) if d.get(key) else None
@@ -945,7 +1016,7 @@ def _br_get_player_logs(br_player_id: str, season: int) -> list[dict]:
 
         logs.append({
             "season":     season,
-            "player_id":  br_player_id,
+            "player_id":  espn_player_id,   # always write with ESPN ID
             "game_date":  date,
             "team":       norm(d.get('team_id', '')),
             "opponent":   norm(d.get('opp_id', '')),
@@ -965,32 +1036,47 @@ def _br_get_player_logs(br_player_id: str, season: int) -> list[dict]:
 
 
 def _scrape_br(season: int = int(CURRENT_SEASON)) -> int:
-    """Scrape all active WNBA player game logs from Basketball-Reference.
-    Rate-limited to stay within BR's informal ToS (1 req/s per player page).
+    """Scrape active WNBA player game logs from Basketball-Reference.
+    Incremental: each player is only scraped when their latest local game is
+    more than 1 day old (avoids re-downloading the full season every run).
     Returns total rows upserted."""
+    _ensure_br_name_map()
     log.info("BR scraper: collecting rosters for %d season…", season)
-    all_players: dict[str, tuple[str, str, str]] = {}  # br_id → (br_id, name, team)
+    all_players: dict[str, tuple[str, str, str]] = {}
     for abbr in _BR_TEAM_ABBRS:
         roster = _br_get_team_roster(abbr, season)
         for entry in roster:
             all_players[entry[0]] = entry
-        time.sleep(2)  # polite crawl delay between team pages
+        time.sleep(2)
 
     if not all_players:
         log.warning("BR scraper: no players found — skipping log scrape")
         return 0
 
-    log.info("BR scraper: %d players found, fetching game logs…", len(all_players))
+    today_str = datetime.now(ET).strftime("%Y-%m-%d")
+    yesterday_str = (datetime.now(ET) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    log.info("BR scraper: %d players found, fetching incremental game logs…", len(all_players))
     total = 0
+    skipped = 0
     for br_id, name, team in all_players.values():
-        logs = _br_get_player_logs(br_id, season)
+        espn_id = _resolve_espn_id(br_id, name)
+        latest_local = _db_latest_game_date_for_player(espn_id)
+
+        # Skip players whose data is already current (latest game yesterday or today)
+        if latest_local and latest_local >= yesterday_str:
+            skipped += 1
+            continue
+
+        logs = _br_get_player_logs(br_id, espn_id, season, since_date=latest_local)
         if logs:
             n = _db_upsert_logs(logs)
             total += n
-            log.debug("BR scraper: %s (%s) — %d rows", name, br_id, n)
-        time.sleep(3)  # polite crawl delay between player pages (BR allows ~20 req/min)
+            log.info("BR scraper: %s → ESPN %s — %d new rows (since %s)",
+                     name, espn_id, n, latest_local or "beginning")
+        time.sleep(3)
 
-    log.info("BR scraper: done — upserted %d rows for %d players", total, len(all_players))
+    log.info("BR scraper: done — %d new rows; %d players already current", total, skipped)
     return total
 
 
