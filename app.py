@@ -214,8 +214,11 @@ def schedule():
         r.raise_for_status()
         data = r.json()
     except Exception as exc:
-        log.warning("schedule fetch failed: %s", exc)
+        log.warning("schedule fetch failed: %s: %s", type(exc).__name__, exc)
         return jsonify({"date": date_iso, "games": []})
+
+    if not data.get("events"):
+        log.warning("schedule: ESPN returned 200 but 0 events for %s (status=%s)", date_nodash, r.status_code)
 
     games = []
     for event in data.get("events", []):
@@ -870,7 +873,7 @@ def _scrape_date_range(days: int = 30) -> int:
             r.raise_for_status()
             data = r.json()
         except Exception as exc:
-            log.debug("Scoreboard fetch failed for %s: %s", ds, exc)
+            log.warning("Scoreboard fetch failed for %s: %s: %s", ds, type(exc).__name__, exc)
             return []
         return [
             (e.get("id", ""), iso)
@@ -1219,7 +1222,7 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
             r.raise_for_status()
             data = r.json()
         except Exception as exc:
-            log.debug("Scoreboard fetch failed for %s: %s", ds, exc)
+            log.warning("Scoreboard fetch failed for %s: %s: %s", ds, type(exc).__name__, exc)
             return []
         return [
             (e.get("id", ""), iso)
