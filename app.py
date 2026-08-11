@@ -18,6 +18,7 @@ Endpoints:
 
 import os
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -844,117 +845,187 @@ def _seed_db_from_starter_logs() -> int:
     return n
 
 
-# ── Parallel ESPN scraper ─────────────────────────────────────────────────────
+# ── Basketball-Reference scraper ─────────────────────────────────────────────
 
-def _scrape_date_range(days: int = 30) -> int:
-    """
-    Fetch ESPN box scores for every completed/live WNBA game in the last
-    `days` days and upsert them into the SQLite DB.
+# BR team abbreviations used in their URLs (subset of what we need for 2026)
+_BR_TEAM_ABBRS = [
+    "ATL", "CHI", "CON", "DAL", "GSV", "IND", "LAS", "LVA",
+    "MIN", "NYL", "PHX", "SEA", "WSH",
+]
 
-    Uses two modestly-sized worker pools (4 each) so ESPN requests stay spread
-    out rather than firing in one large burst, which cloud-hosting IP ranges
-    are more likely to have rate-limited or filtered.
+_br_session = requests.Session()
+_br_session.headers.update({
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+})
+_br_session.trust_env = False
 
-    Returns the total number of log rows upserted.
-    """
-    today_dt = datetime.now(ET)
 
-    # ── 1. Collect event IDs (parallel) ──────────────────────────────────────
-    def _fetch_day_events(delta: int) -> list[tuple[str, str]]:
-        day = today_dt - timedelta(days=delta)
-        ds  = day.strftime("%Y%m%d")
-        iso = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
-        try:
-            r = espn.get(
-                "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
-                params={"dates": ds},
-                timeout=10,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as exc:
-            log.warning("Scoreboard fetch failed for %s: %s: %s", ds, type(exc).__name__, exc)
-            return []
-        return [
-            (e.get("id", ""), iso)
-            for e in data.get("events", [])
-            if e.get("status", {}).get("type", {}).get("state", "") in ("in", "post")
-            and e.get("id")
-        ]
+def _br_team_url_abbr(abbr: str) -> str:
+    """Map app team abbreviation to Basketball-Reference URL abbreviation."""
+    return {"LVA": "LVG", "GSV": "GSV", "WSH": "WAS"}.get(abbr, abbr)
 
-    event_ids: list[tuple[str, str]] = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for result in as_completed(
-            [pool.submit(_fetch_day_events, d) for d in range(days)]
-        ):
-            event_ids.extend(result.result())
 
-    log.info("Scraper: %d completed/live events over last %d days", len(event_ids), days)
+def _br_get_team_roster(team_abbr: str, season: int) -> list[tuple[str, str, str]]:
+    """Return list of (br_player_id, name, team_abbr) for a team's current roster.
+    Uses the team season page; data is in HTML comments."""
+    br_abbr = _br_team_url_abbr(team_abbr)
+    url = f"https://www.basketball-reference.com/wnba/teams/{br_abbr}/{season}.html"
+    try:
+        r = _br_session.get(url, timeout=15)
+        r.raise_for_status()
+    except Exception as exc:
+        log.warning("BR roster fetch failed for %s: %s", team_abbr, exc)
+        return []
+    # Roster table is hidden in an HTML comment
+    text = r.text
+    # Combine main document + comment content so we find either
+    combined = text + " ".join(re.findall(r'<!--(.*?)-->', text, re.DOTALL))
+    entries = re.findall(
+        r"href='/wnba/players/[a-z]/([^'\"]+)\.html'[^>]*>([^<]+)</a>",
+        combined
+    )
+    seen: dict[str, tuple[str, str, str]] = {}
+    for br_id, name in entries:
+        name = name.strip()
+        if br_id and name and br_id not in seen:
+            seen[br_id] = (br_id, name, team_abbr)
+    return list(seen.values())
 
-    # ── 2. Fetch box scores + extract player logs (parallel) ─────────────────
-    def _fetch_box(event_id: str, game_date: str) -> list[dict]:
-        try:
-            r = espn.get(
-                "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
-                params={"event": event_id},
-                timeout=12,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as exc:
-            log.debug("Box score %s failed: %s", event_id, exc)
-            return []
-        idx: dict[str, list] = {}
-        _extract_boxscore(data, game_date, CURRENT_SEASON, idx)
-        return [row for rows in idx.values() for row in rows]
 
-    all_logs: list[dict] = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(_fetch_box, eid, gdate): (eid, gdate)
-            for eid, gdate in event_ids
-        }
-        for future in as_completed(futures):
-            all_logs.extend(future.result())
+def _br_get_player_logs(br_player_id: str, season: int) -> list[dict]:
+    """Scrape per-game stats from Basketball-Reference for one player/season.
+    Returns log dicts compatible with _db_upsert_logs."""
+    url = f"https://www.basketball-reference.com/wnba/players/{br_player_id[0]}/{br_player_id}/gamelog/{season}/"
+    try:
+        r = _br_session.get(url, timeout=15)
+        r.raise_for_status()
+    except Exception as exc:
+        log.debug("BR gamelog fetch failed for %s: %s", br_player_id, exc)
+        return []
 
-    n = _db_upsert_logs(all_logs)
-    log.info("Scraper: upserted %d rows from %d events", n, len(event_ids))
-    return n
+    text = r.text
+    first_row = text.find('data-stat="date_game" ><a href="/wnba/boxscores/')
+    if first_row == -1:
+        return []
+
+    table_start = text.rfind("<table", 0, first_row)
+    table_end = text.find("</table>", first_row) + len("</table>")
+    table = text[table_start:table_end]
+
+    rows = re.findall(r'<tr\b[^>]*>(.*?)</tr>', table, re.DOTALL)
+    logs = []
+    for row in rows:
+        if 'date_game' not in row:
+            continue
+        cells = re.findall(r'data-stat="([^"]+)"[^>]*>(.*?)</t[hd]>', row, re.DOTALL)
+        d = {k: re.sub(r'<[^>]+>', '', v).strip() for k, v in cells}
+        date = d.get('date_game', '')
+        if not date or date == 'Date' or len(date) != 10:
+            continue
+        # skip DNP / inactive rows
+        if not d.get('pts') and not d.get('mp'):
+            continue
+
+        def _f(key: str):
+            try: return float(d[key]) if d.get(key) else None
+            except (ValueError, TypeError): return None
+
+        def _mp_seconds(mp_str: str) -> float | None:
+            if not mp_str or ':' not in mp_str:
+                return None
+            parts = mp_str.split(':')
+            try: return int(parts[0]) * 60 + int(parts[1])
+            except (ValueError, IndexError): return None
+
+        logs.append({
+            "season":     season,
+            "player_id":  br_player_id,
+            "game_date":  date,
+            "team":       norm(d.get('team_id', '')),
+            "opponent":   norm(d.get('opp_id', '')),
+            "mp_seconds": _mp_seconds(d.get('mp', '')),
+            "pts":        _f('pts'),
+            "reb":        _f('trb'),
+            "ast":        _f('ast'),
+            "three_p":    _f('fg3'),
+            "ftm":        _f('ft'),
+            "fga":        _f('fga'),
+            "fta":        _f('fta'),
+            "stl":        _f('stl'),
+            "blk":        _f('blk'),
+            "tov":        _f('tov'),
+        })
+    return logs
+
+
+def _scrape_br(season: int = int(CURRENT_SEASON)) -> int:
+    """Scrape all active WNBA player game logs from Basketball-Reference.
+    Rate-limited to stay within BR's informal ToS (1 req/s per player page).
+    Returns total rows upserted."""
+    log.info("BR scraper: collecting rosters for %d season…", season)
+    all_players: dict[str, tuple[str, str, str]] = {}  # br_id → (br_id, name, team)
+    for abbr in _BR_TEAM_ABBRS:
+        roster = _br_get_team_roster(abbr, season)
+        for entry in roster:
+            all_players[entry[0]] = entry
+        time.sleep(2)  # polite crawl delay between team pages
+
+    if not all_players:
+        log.warning("BR scraper: no players found — skipping log scrape")
+        return 0
+
+    log.info("BR scraper: %d players found, fetching game logs…", len(all_players))
+    total = 0
+    for br_id, name, team in all_players.values():
+        logs = _br_get_player_logs(br_id, season)
+        if logs:
+            n = _db_upsert_logs(logs)
+            total += n
+            log.debug("BR scraper: %s (%s) — %d rows", name, br_id, n)
+        time.sleep(3)  # polite crawl delay between player pages (BR allows ~20 req/min)
+
+    log.info("BR scraper: done — upserted %d rows for %d players", total, len(all_players))
+    return total
 
 
 _scrape_lock  = threading.Lock()
-_scrape_ready = threading.Event()   # set after the initial 30-day scrape
+_scrape_ready = threading.Event()
 
 
 def _background_scraper() -> None:
     """
     Background daemon thread.
-    • On cold start: scrapes the last 30 days (bridges the gap since the
-      bundled seed data, without a large burst of ESPN requests).
-    • Every 20 minutes after that: re-scrapes the last 3 days to pick up
-      any games that finished or went live since the last run.
+    • On cold start: full BR scrape for all active players (runs once, ~10–15 min).
+    • Every 6 hours after that: re-runs to pick up any newly completed games.
+    BR requests are rate-limited to ~20/min per the _scrape_br delays.
     """
     if _scrape_lock.acquire(blocking=False):
         try:
-            log.info("Background scraper: initial 30-day scrape starting…")
-            _scrape_date_range(days=30)
+            log.info("Background scraper: initial BR scrape starting…")
+            _scrape_br(season=int(CURRENT_SEASON))
             log.info(
-                "Background scraper: initial scrape done — %d rows in DB",
+                "Background scraper: initial BR scrape done — %d rows in DB",
                 _db_row_count(),
             )
         except Exception as exc:
-            log.warning("Background scraper: initial scrape failed: %s", exc)
+            log.warning("Background scraper: initial BR scrape failed: %s", exc)
         finally:
             _scrape_ready.set()
             _scrape_lock.release()
 
     while True:
-        time.sleep(1200)  # 20-minute refresh interval
+        time.sleep(6 * 3600)  # re-scrape every 6 hours
         if _scrape_lock.acquire(blocking=False):
             try:
-                _scrape_date_range(days=3)
+                _scrape_br(season=int(CURRENT_SEASON))
             except Exception as exc:
-                log.warning("Background scraper: incremental scrape failed: %s", exc)
+                log.warning("Background scraper: incremental BR scrape failed: %s", exc)
             finally:
                 _scrape_lock.release()
 
@@ -1671,24 +1742,17 @@ def box_score():
 @app.route("/wnba/scrape")
 def scrape():
     """
-    Manually trigger a scrape of recent WNBA game logs.
-    Query params:
-      days (optional) — how many days to scrape, default 7, max 90
+    Manually trigger a Basketball-Reference scrape for all active WNBA players.
     Response: { status, rows_upserted, total_rows }
     """
-    try:
-        days = min(int(request.args.get("days", 7)), 90)
-    except (ValueError, TypeError):
-        days = 7
-
     if not _scrape_lock.acquire(blocking=False):
         return jsonify({"status": "busy", "message": "Scrape already in progress"}), 202
 
     try:
-        n = _scrape_date_range(days=days)
+        n = _scrape_br(season=int(CURRENT_SEASON))
         return jsonify({"status": "ok", "rows_upserted": n, "total_rows": _db_row_count()})
     except Exception as exc:
-        log.exception("Manual scrape failed: %s", exc)
+        log.exception("Manual BR scrape failed: %s", exc)
         return jsonify({"status": "error", "error": str(exc)}), 500
     finally:
         _scrape_lock.release()
