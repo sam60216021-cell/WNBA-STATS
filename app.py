@@ -6,14 +6,21 @@ WNBA Stats Server — Render deployment
 Serves schedule, standings, rosters, player logs, and lineups for the
 Shattered Backboard WNBA iOS app.
 
+Data sources:
+  • ESPN (public JSON APIs) — schedule, standings, rosters
+  • stats.wnba.com (public JSON API) — rosters fallback, per-player logs
+  • balldontlie WNBA API (free key, set BDL_API_KEY) — daily game-log sync
+    into SQLite + schedule/standings fallback when ESPN is filtered
+
 Endpoints:
   GET /                        — health check
-  GET /wnba/schedule           — today's games (ESPN)
-  GET /wnba/standings          — conference standings (ESPN)
-  GET /wnba/roster             — full player list with IDs (stats.wnba.com)
+  GET /wnba/schedule           — games for a date (ESPN, balldontlie fallback)
+  GET /wnba/standings          — conference standings (ESPN, balldontlie fallback)
+  GET /wnba/roster             — full player list with IDs (ESPN)
   GET /wnba/stats              — same as /roster (alias)
   GET /wnba/lineups            — projected starters for today's games
   GET /wnba/player_logs        — game log for one player (?player_id=X&season=Y&days=N)
+  GET /wnba/sync               — trigger a balldontlie game-log sync (?days=N)
 """
 
 import os
@@ -92,6 +99,98 @@ wnba_stats.headers.update({
 })
 # Avoid env/netrc auth resolution overhead and occasional import-lock stalls.
 wnba_stats.trust_env = False
+
+# balldontlie WNBA API — optional key-based data source ─────────────────────────
+# Free tier (https://balldontlie.io): $0/mo, one sport, 5 requests/minute.
+# Create a key at https://app.balldontlie.io and set BDL_API_KEY to enable.
+# This replaces Basketball-Reference scraping as the source for daily
+# game-log updates (schedule/standings also fall back to it when ESPN is
+# filtered from datacenter IPs).
+
+BDL_API_KEY     = os.environ.get("BDL_API_KEY", "").strip()
+BDL_BASE        = "https://api.balldontlie.io/wnba/v1"
+# 5 req/min free-tier limit with a safety margin (seconds between requests).
+BDL_MIN_INTERVAL = float(os.environ.get("BDL_MIN_INTERVAL", "12.5") or 12.5)
+
+bdl = requests.Session()
+bdl.headers.update({
+    "Accept":        "application/json",
+    "Authorization": BDL_API_KEY,   # BDL expects the raw key, no "Bearer" prefix
+    "User-Agent":    "shattered-backboard-wnba/1.0",
+})
+bdl.trust_env = False
+
+_bdl_lock        = threading.Lock()
+_bdl_last_request = 0.0
+
+
+def _bdl_throttle(wait: bool) -> bool:
+    """Reserve the next rate-limit slot.
+
+    Returns True when a request may proceed. When the budget is spent:
+    • wait=True  → sleep until the next slot frees up (background sync).
+    • wait=False → return False immediately so web request paths never block.
+    """
+    global _bdl_last_request
+    while True:
+        with _bdl_lock:
+            now = time.time()
+            if now >= _bdl_last_request + BDL_MIN_INTERVAL:
+                _bdl_last_request = now
+                return True
+            remaining = _bdl_last_request + BDL_MIN_INTERVAL - now
+        if not wait:
+            return False
+        time.sleep(min(remaining, 5.0) + 0.05)
+
+
+def _bdl_get(path: str, params: dict | None = None, timeout: int = 15,
+             wait: bool = False) -> dict | None:
+    """GET one page from the balldontlie WNBA API. Returns parsed JSON or None."""
+    if not BDL_API_KEY:
+        return None
+    for attempt in (1, 2):
+        if not _bdl_throttle(wait=wait and attempt == 1):
+            return None   # rate budget spent and caller must not block
+        try:
+            r = bdl.get(f"{BDL_BASE}{path}", params=params, timeout=timeout)
+            if r.status_code == 429 and attempt == 1:
+                # Push the next slot out by Retry-After, then retry once.
+                try:
+                    delay = min(float(r.headers.get("Retry-After", "13") or 13), 65.0)
+                except ValueError:
+                    delay = 13.0
+                with _bdl_lock:
+                    _bdl_last_request = max(_bdl_last_request, time.time() + delay)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            log.warning("BDL request failed %s %s: %s", path, params, exc)
+            return None
+    return None
+
+
+def _bdl_get_all(path: str, params: dict | None = None, max_pages: int = 25,
+                 wait: bool = True) -> list[dict]:
+    """Paginate a cursor-based BDL endpoint (per_page=100). Best effort —
+    returns whatever pages succeeded, [] when the first page fails."""
+    out: list[dict] = []
+    cursor = None
+    for _ in range(max_pages):
+        q = dict(params or {})
+        q["per_page"] = 100
+        if cursor is not None:
+            q["cursor"] = cursor
+        data = _bdl_get(path, params=q, wait=wait)
+        if not data:
+            break
+        rows = data.get("data") or []
+        out.extend(rows)
+        cursor = (data.get("meta") or {}).get("next_cursor")
+        if not cursor:
+            break
+    return out
 
 # ── WNBA constants ─────────────────────────────────────────────────────────────
 CURRENT_SEASON = os.environ.get("WNBA_SEASON", "") or (
@@ -221,6 +320,47 @@ def health():
     return jsonify({"status": "ok", "sport": "wnba", "season": CURRENT_SEASON})
 
 # ── /wnba/schedule ─────────────────────────────────────────────────────────────
+def _bdl_schedule(date_iso: str) -> list[dict]:
+    """One day's games from balldontlie, in the same shape the app expects.
+
+    Used when ESPN is unavailable/filtered (its responses are frequently
+    empty or blocked from datacenter IP ranges). Non-blocking on the BDL
+    rate budget — returns [] when the budget is spent this minute.
+    """
+    data = _bdl_get("/games", params={"dates[]": date_iso}, wait=False)
+    games: list[dict] = []
+    for g in (data or {}).get("data") or []:
+        home = norm((g.get("home_team") or {}).get("abbreviation", ""))
+        away = norm((g.get("visitor_team") or {}).get("abbreviation", ""))
+        if not home or not away:
+            continue
+        status    = str(g.get("status") or "")
+        status_lc = status.lower()
+        if "final" in status_lc or "complete" in status_lc:
+            state, status_desc = "post", status.title()
+        elif status and status_lc not in ("scheduled", "pre"):
+            state, status_desc = "in", status.title()
+        else:
+            state, status_desc = "pre", "Scheduled"
+        status_code = 2 if state == "in" else (3 if state == "post" else 1)
+        games.append({
+            "game_id":     str(g.get("id", "")),
+            "date":        date_iso,
+            "away":        away,
+            "home":        home,
+            "tip":         _parse_espn_tip(str(g.get("date") or "")),
+            "status":      status_desc,
+            "game_type":   "postseason" if g.get("postseason") else "regular",
+            "status_code": status_code,
+            "home_score":  int(g.get("home_score") or 0),
+            "away_score":  int(g.get("away_score") or 0),
+            "period":      int(g.get("period") or 0),
+            "missing_away_players": [],
+            "missing_home_players": [],
+        })
+    return games
+
+
 @app.route("/wnba/schedule")
 def schedule():
     date_param  = request.args.get("date", today_et())
@@ -235,19 +375,19 @@ def schedule():
         "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
         f"?dates={date_nodash}"
     )
+    data = None
     try:
         r = espn.get(url, timeout=12)
         r.raise_for_status()
         data = r.json()
     except Exception as exc:
         log.warning("schedule fetch failed: %s: %s", type(exc).__name__, exc)
-        return jsonify({"date": date_iso, "games": []})
 
-    if not data.get("events"):
-        log.warning("schedule: ESPN returned 200 but 0 events for %s (status=%s)", date_nodash, r.status_code)
+    if data is not None and not data.get("events"):
+        log.warning("schedule: ESPN returned 200 but 0 events for %s", date_nodash)
 
     games = []
-    for event in data.get("events", []):
+    for event in (data or {}).get("events", []):
         comp        = (event.get("competitions") or [{}])[0]
         competitors = comp.get("competitors", [])
         home_c = next((c for c in competitors if c.get("homeAway") == "home"), None)
@@ -286,6 +426,13 @@ def schedule():
             "missing_home_players": [],
         })
 
+    if not games:
+        # ESPN empty/blocked → fall back to balldontlie (no-op without key)
+        bdl_games = _bdl_schedule(date_iso)
+        if bdl_games:
+            log.info("schedule: using %d games from balldontlie for %s", len(bdl_games), date_iso)
+            games = bdl_games
+
     result = {"date": date_iso, "games": games}
     # Cache 2 min for today; longer for past dates
     ttl = 120 if date_iso == today_et() else 3600
@@ -293,22 +440,66 @@ def schedule():
     return jsonify(result)
 
 # ── /wnba/standings ────────────────────────────────────────────────────────────
+def _bdl_standings(season: str = CURRENT_SEASON) -> list[dict]:
+    """Conference standings from balldontlie in the app's expected shape.
+
+    Used when ESPN is unavailable/filtered. Fields ESPN provides but BDL
+    does not (last_10, streak, points for/against) are filled with "" / 0.0.
+    Non-blocking on the BDL rate budget.
+    """
+    rows = _bdl_get_all("/standings", params={"season": season}, max_pages=2, wait=False)
+    entries: list[dict] = []
+    for row in rows:
+        team = row.get("team") or {}
+        abbr = norm(team.get("abbreviation", ""))
+        if not abbr:
+            continue
+        conf = str(row.get("conference") or "")
+        if conf and "conference" not in conf.lower():
+            conf = f"{conf} Conference"
+        try:
+            wins   = int(row.get("wins") or 0)
+            losses = int(row.get("losses") or 0)
+        except (TypeError, ValueError):
+            wins = losses = 0
+        total = wins + losses
+        try:
+            pct = round(float(row.get("win_percentage") or 0.0), 3) if row.get("win_percentage") \
+                else (round(wins / total, 3) if total else 0.0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        entries.append({
+            "team_abbreviation": abbr,
+            "conference":        conf,
+            "wins":              wins,
+            "losses":            losses,
+            "pct":               pct,
+            "home_record":       str(row.get("home_record") or ""),
+            "road_record":       str(row.get("away_record") or ""),
+            "last_10":           "",
+            "streak":            "",
+            "points_pg":         0.0,
+            "opp_points_pg":     0.0,
+        })
+    return entries
+
+
 @app.route("/wnba/standings")
 def standings():
     if (cached := cache_get("standings")):
         return jsonify(cached)
 
     url = "https://site.api.espn.com/apis/v2/sports/basketball/wnba/standings"
+    data = None
     try:
         r = espn.get(url, timeout=12)
         r.raise_for_status()
         data = r.json()
     except Exception as exc:
         log.warning("standings fetch failed: %s", exc)
-        return jsonify({"standings": []})
 
     entries = []
-    for group in data.get("children", []):
+    for group in (data or {}).get("children", []):
         conf_name = group.get("name", "")
         for entry in group.get("standings", {}).get("entries", []):
             team     = entry.get("team", {})
@@ -345,6 +536,13 @@ def standings():
                 "points_pg":         sv("pointsFor",     0.0),
                 "opp_points_pg":     sv("pointsAgainst", 0.0),
             })
+
+    if not entries:
+        # ESPN empty/blocked → fall back to balldontlie (no-op without key)
+        bdl_entries = _bdl_standings(CURRENT_SEASON)
+        if bdl_entries:
+            log.info("standings: using %d entries from balldontlie", len(bdl_entries))
+            entries = bdl_entries
 
     result = {"standings": entries}
     cache_set("standings", result, ttl=600)
@@ -687,7 +885,7 @@ def _fetch_all_players(season: str = CURRENT_SEASON) -> list[dict]:
 # Preferred location is a Render persistent disk (see render.yaml: disk
 # `wnba-data` mounted at /var/data) so logs survive deploys/restarts.
 # Falls back to /tmp when no disk is mounted (local dev / disk detached) —
-# the background scraper repopulates it automatically on every cold start.
+# the background balldontlie sync repopulates it automatically on every cold start.
 
 DB_PATH = (
     os.environ.get("WNBA_DB_PATH")
@@ -875,259 +1073,174 @@ def _seed_db_from_starter_logs() -> int:
     return n
 
 
-# ── Basketball-Reference scraper ─────────────────────────────────────────────
+# ── balldontlie game-log sync (replaces Basketball-Reference scraping) ─────────
+# Pulls finished-game box scores from the free balldontlie WNBA API into the
+# same SQLite game_logs table the app already reads. Rows are keyed on ESPN
+# player IDs (what the app and seed data use), resolved by name matching
+# against the StarterLogs seed + the live ESPN roster.
 
-# BR team abbreviations used in their URLs (subset of what we need for 2026)
-_BR_TEAM_ABBRS = [
-    "ATL", "CHI", "CON", "DAL", "GSV", "IND", "LAS", "LVA",
-    "MIN", "NYL", "PHX", "SEA", "WSH",
-]
-
-_br_session = requests.Session()
-_br_session.headers.update({
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-})
-_br_session.trust_env = False
+_name_to_espn_id: dict[str, str] = {}      # normalized full name → ESPN player_id
+_bdl_id_to_espn:  dict[int, str] = {}      # balldontlie player id → ESPN player_id ("" = unmapped)
 
 
 def _normalize_name(name: str) -> str:
-    """Lowercase, strip punctuation — used for fuzzy player name matching."""
+    """Lowercase, strip punctuation/diacritics — used for fuzzy name matching."""
     import unicodedata
-    nfkd = unicodedata.normalize("NFKD", name)
+    nfkd = unicodedata.normalize("NFKD", name or "")
     ascii_name = nfkd.encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]", "", ascii_name.lower())
 
 
-_br_name_to_espn_id: dict[str, str] = {}   # normalized_name → ESPN player_id
-_br_name_map_built = False
-
-
-def _ensure_br_name_map() -> None:
-    """Build a name → ESPN player_id lookup from the existing game_logs DB rows.
-    Called once lazily so it's populated from the seed data before scraping."""
-    global _br_name_to_espn_id, _br_name_map_built
-    if _br_name_map_built:
+def _ensure_name_map() -> None:
+    """Build normalized name → ESPN player_id from the StarterLogs seed file
+    plus the live ESPN roster (best effort). Lazy, once per process."""
+    if _name_to_espn_id:
         return
-    # Pull distinct player_id + name from stored game_logs via SQLite directly
-    # The seed data was imported with ESPN IDs so this map is ESPN-ID keyed.
+    # 1. Seed file (bundled or downloaded) — the reliable source on Render
+    path = _seed_logs_path()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            for p in payload.get("players", []):
+                pid, name = p.get("player_id", ""), p.get("name", "")
+                if pid and name:
+                    _name_to_espn_id[_normalize_name(name)] = str(pid)
+            log.info("BDL name map: %d entries from seed %s", len(_name_to_espn_id), path)
+        except Exception as exc:
+            log.warning("BDL name map: seed load failed: %s", exc)
+    # 2. ESPN roster (best effort — may be filtered from datacenter IPs)
     try:
-        with _db_conn() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT player_id, team FROM game_logs"
-            ).fetchall()
-        # We don't store names in game_logs; use the seed file for the mapping.
-        path = _seed_logs_path()
-        if not path:
-            return
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        for p in payload.get("players", []):
-            pid  = p.get("player_id", "")
-            name = p.get("name", "")
-            if pid and name:
-                _br_name_to_espn_id[_normalize_name(name)] = pid
-        _br_name_map_built = True
-        log.info("BR ID map: loaded %d name→ESPN-ID entries from seed", len(_br_name_to_espn_id))
+        for p in _fetch_all_players_espn():
+            _name_to_espn_id.setdefault(_normalize_name(p.get("name", "")), str(p.get("player_id", "")))
+        log.info("BDL name map: %d entries after ESPN roster merge", len(_name_to_espn_id))
     except Exception as exc:
-        log.warning("BR ID map build failed: %s", exc)
+        log.warning("BDL name map: ESPN roster merge failed: %s", exc)
 
 
-def _resolve_espn_id(br_id: str, br_name: str) -> str:
-    """Return the ESPN player_id for a BR player, falling back to the BR ID itself."""
-    _ensure_br_name_map()
-    key = _normalize_name(br_name)
-    espn_id = _br_name_to_espn_id.get(key)
-    if espn_id:
-        return espn_id
-    # Try last-name-only match as a fallback (handles minor name differences)
-    parts = key.split()
-    if len(parts) >= 2:
-        last = parts[-1]
-        candidates = [v for k, v in _br_name_to_espn_id.items() if k.endswith(last)]
-        if len(candidates) == 1:
-            return candidates[0]
-    # No match — store under BR ID; new player or name mismatch
-    return br_id
+def _espn_id_for_bdl_player(player: dict) -> str | None:
+    """Map a balldontlie player object ({id, first_name, last_name}) to the
+    ESPN player_id via name matching. Results cached per BDL ID."""
+    bdl_id = player.get("id")
+    if bdl_id in _bdl_id_to_espn:
+        return _bdl_id_to_espn[bdl_id] or None
+    _ensure_name_map()
+    name = " ".join(x for x in (player.get("first_name"), player.get("last_name")) if x)
+    espn_id = _name_to_espn_id.get(_normalize_name(name))
+    if not espn_id:
+        # Unique last-name match fallback (handles minor name differences)
+        last = _normalize_name(player.get("last_name") or "")
+        if last:
+            candidates = {v for k, v in _name_to_espn_id.items() if k.endswith(last)}
+            if len(candidates) == 1:
+                espn_id = next(iter(candidates))
+    _bdl_id_to_espn[bdl_id] = espn_id or ""
+    return espn_id
 
 
-def _db_latest_game_date_for_player(player_id: str) -> str | None:
-    """Return the latest game_date in the DB for a given player_id, or None."""
-    try:
-        with _db_conn() as conn:
-            row = conn.execute(
-                "SELECT MAX(game_date) FROM game_logs WHERE player_id = ?",
-                (player_id,)
-            ).fetchone()
-        return row[0] if row else None
-    except Exception:
-        return None
+def _sync_bdl_logs(start_date: str, end_date: str) -> dict:
+    """Pull box scores from balldontlie for a date window and upsert them into
+    the game_logs DB (keyed on ESPN player IDs).
 
+    Regular-season only (parity with the old BR source). Blocks on the BDL
+    rate budget as needed — intended for the background/manual sync paths.
+    Returns {games, rows, unmapped}.
+    """
+    if not BDL_API_KEY:
+        log.warning("BDL sync skipped: BDL_API_KEY not configured")
+        return {"games": 0, "rows": 0, "unmapped": 0}
 
-def _br_team_url_abbr(abbr: str) -> str:
-    """Map app team abbreviation to Basketball-Reference URL abbreviation."""
-    # NOTE: this helper was accidentally dropped in commit d13262b — restored
-    # verbatim from a4a64e0. Without it, _br_get_team_roster raises NameError
-    # on every cold start, so the DB never repopulates.
-    return {"LVA": "LVG", "GSV": "GSV", "WSH": "WAS"}.get(abbr, abbr)
+    season = int(CURRENT_SEASON) if str(CURRENT_SEASON).isdigit() else None
+    games_params: dict = {"start_date": start_date, "end_date": end_date}
+    if season:
+        games_params["seasons[]"] = season
 
+    games = _bdl_get_all("/games", params=games_params)
+    games_by_id: dict = {}
+    for g in games:
+        games_by_id[g.get("id")] = {
+            "home":       norm((g.get("home_team") or {}).get("abbreviation", "")),
+            "away":       norm((g.get("visitor_team") or {}).get("abbreviation", "")),
+            "date":       str(g.get("date") or "")[:10],
+            "postseason": bool(g.get("postseason")),
+        }
 
-def _br_get_team_roster(team_abbr: str, season: int) -> list[tuple[str, str, str]]:
-    """Return list of (br_player_id, name, team_abbr) for a team's current roster."""
-    br_abbr = _br_team_url_abbr(team_abbr)
-    url = f"https://www.basketball-reference.com/wnba/teams/{br_abbr}/{season}.html"
-    try:
-        r = _br_session.get(url, timeout=15)
-        r.raise_for_status()
-    except Exception as exc:
-        log.warning("BR roster fetch failed for %s: %s", team_abbr, exc)
-        return []
-    text = r.text
-    combined = text + " ".join(re.findall(r'<!--(.*?)-->', text, re.DOTALL))
-    entries = re.findall(
-        r"href=['\"]?/wnba/players/[a-z]/([^'\"]+)\.html['\"]?[^>]*>([^<]+)</a>",
-        combined
-    )
-    seen: dict[str, tuple[str, str, str]] = {}
-    for br_id, name in entries:
-        name = name.strip()
-        if br_id and name and br_id not in seen:
-            seen[br_id] = (br_id, name, team_abbr)
-    return list(seen.values())
+    stat_rows = _bdl_get_all("/player_stats", params={
+        "start_date": start_date, "end_date": end_date,
+    })
 
-
-def _br_get_player_logs(br_player_id: str, espn_player_id: str, season: int,
-                        since_date: str | None = None) -> list[dict]:
-    """Scrape per-game stats from Basketball-Reference for one player/season.
-    Writes logs with espn_player_id so they join the existing DB keyed on ESPN IDs.
-    Only returns rows with game_date > since_date (if provided)."""
-    url = (
-        f"https://www.basketball-reference.com/wnba/players"
-        f"/{br_player_id[0]}/{br_player_id}/gamelog/{season}/"
-    )
-    try:
-        r = _br_session.get(url, timeout=15)
-        r.raise_for_status()
-    except Exception as exc:
-        log.debug("BR gamelog fetch failed for %s: %s", br_player_id, exc)
-        return []
-
-    text = r.text
-    first_row = text.find('data-stat="date_game" ><a href="/wnba/boxscores/')
-    if first_row == -1:
-        return []
-
-    table_start = text.rfind("<table", 0, first_row)
-    table_end = text.find("</table>", first_row) + len("</table>")
-    table = text[table_start:table_end]
-
-    rows = re.findall(r'<tr\b[^>]*>(.*?)</tr>', table, re.DOTALL)
-    logs = []
-    for row in rows:
-        if 'date_game' not in row:
+    logs: list[dict] = []
+    unmapped = 0
+    for row in stat_rows:
+        game     = row.get("game") or {}
+        game_id  = game.get("id")
+        meta     = games_by_id.get(game_id)
+        if meta and meta["postseason"]:
             continue
-        cells = re.findall(r'data-stat="([^"]+)"[^>]*>(.*?)</t[hd]>', row, re.DOTALL)
-        d = {k: re.sub(r'<[^>]+>', '', v).strip() for k, v in cells}
-        date = d.get('date_game', '')
-        if not date or date == 'Date' or len(date) != 10:
+        if not row.get("min"):          # DNP / inactive — nothing to store
             continue
-        if not d.get('pts') and not d.get('mp'):
+        espn_id = _espn_id_for_bdl_player(row.get("player") or {})
+        if not espn_id:
+            unmapped += 1
             continue
-        if since_date and date <= since_date:
-            continue   # already have this row; skip
 
-        def _f(key: str):
-            try: return float(d[key]) if d.get(key) else None
-            except (ValueError, TypeError): return None
+        team_abbr = norm((row.get("team") or {}).get("abbreviation", ""))
+        opponent  = ""
+        if meta:
+            opponent = meta["away"] if team_abbr == meta["home"] else meta["home"]
 
-        def _mp_seconds(mp_str: str) -> float | None:
-            if not mp_str or ':' not in mp_str:
+        def _n(key: str):
+            try:
+                return float(row[key])
+            except (KeyError, TypeError, ValueError):
                 return None
-            parts = mp_str.split(':')
-            try: return int(parts[0]) * 60 + int(parts[1])
-            except (ValueError, IndexError): return None
+
+        try:
+            season_val = int(game.get("season") or season or 0)
+        except (TypeError, ValueError):
+            season_val = 0
+
+        game_date = str(game.get("date") or (meta or {}).get("date") or "")[:10]
+        if not game_date:
+            continue
 
         logs.append({
-            "season":     season,
-            "player_id":  espn_player_id,   # always write with ESPN ID
-            "game_date":  date,
-            "team":       norm(d.get('team_id', '')),
-            "opponent":   norm(d.get('opp_id', '')),
-            "mp_seconds": _mp_seconds(d.get('mp', '')),
-            "pts":        _f('pts'),
-            "reb":        _f('trb'),
-            "ast":        _f('ast'),
-            "three_p":    _f('fg3'),
-            "ftm":        _f('ft'),
-            "fga":        _f('fga'),
-            "fta":        _f('fta'),
-            "stl":        _f('stl'),
-            "blk":        _f('blk'),
-            "tov":        _f('tov'),
+            "season":     season_val,
+            "player_id":  espn_id,
+            "game_date":  game_date,
+            "team":       team_abbr,
+            "opponent":   opponent,
+            "mp_seconds": _parse_wnba_min(row.get("min")),
+            "pts":        _n("pts"),
+            "reb":        _n("reb"),
+            "ast":        _n("ast"),
+            "three_p":    _n("fg3m"),
+            "ftm":        _n("ftm"),
+            "fga":        _n("fga"),
+            "fta":        _n("fta"),
+            "stl":        _n("stl"),
+            "blk":        _n("blk"),
+            "tov":        _n("turnover"),
         })
-    return logs
+
+    written = _db_upsert_logs(logs)
+    if unmapped:
+        log.warning("BDL sync: %d stat rows skipped (no ESPN-ID name match)", unmapped)
+    log.info("BDL sync %s→%s: %d games, %d stat rows, %d written, %d unmapped",
+             start_date, end_date, len(games_by_id), len(stat_rows), written, unmapped)
+    return {"games": len(games_by_id), "rows": written, "unmapped": unmapped}
 
 
-def _scrape_br(season: int = int(CURRENT_SEASON)) -> int:
-    """Scrape active WNBA player game logs from Basketball-Reference.
-    Incremental: each player is only scraped when their latest local game is
-    more than 1 day old (avoids re-downloading the full season every run).
-    Returns total rows upserted."""
-    _ensure_br_name_map()
-    log.info("BR scraper: collecting rosters for %d season…", season)
-    all_players: dict[str, tuple[str, str, str]] = {}
-    for abbr in _BR_TEAM_ABBRS:
-        roster = _br_get_team_roster(abbr, season)
-        for entry in roster:
-            all_players[entry[0]] = entry
-        time.sleep(2)
-
-    if not all_players:
-        log.warning("BR scraper: no players found — skipping log scrape")
-        return 0
-
-    today_str = datetime.now(ET).strftime("%Y-%m-%d")
-    yesterday_str = (datetime.now(ET) - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    log.info("BR scraper: %d players found, fetching incremental game logs…", len(all_players))
-    total = 0
-    skipped = 0
-    for br_id, name, team in all_players.values():
-        espn_id = _resolve_espn_id(br_id, name)
-        latest_local = _db_latest_game_date_for_player(espn_id)
-
-        # Skip players whose data is already current (latest game yesterday or today)
-        if latest_local and latest_local >= yesterday_str:
-            skipped += 1
-            continue
-
-        logs = _br_get_player_logs(br_id, espn_id, season, since_date=latest_local)
-        if logs:
-            n = _db_upsert_logs(logs)
-            total += n
-            log.info("BR scraper: %s → ESPN %s — %d new rows (since %s)",
-                     name, espn_id, n, latest_local or "beginning")
-        time.sleep(3)
-
-    log.info("BR scraper: done — %d new rows; %d players already current", total, skipped)
-    return total
+_sync_lock  = threading.Lock()
+_sync_ready = threading.Event()
 
 
-_scrape_lock  = threading.Lock()
-_scrape_ready = threading.Event()
-
-
-def _scrape_is_fresh() -> bool:
+def _db_is_fresh() -> bool:
     """True when the DB already holds game logs from the last ~24 h.
 
-    With the persistent disk attached, deploys/restarts no longer wipe the DB,
-    so a cold start can skip the 10–15 min full BR scrape and let the 6-hour
-    incremental loop pick up any newly completed games instead.
+    Fresh DBs (persistent disk, or an incremental sync within the last day)
+    can skip the cold-start backfill; the 6-hour incremental loop picks up
+    newly completed games instead.
     """
     try:
         latest = _db_status().get("latest_game_date") or ""
@@ -1139,42 +1252,48 @@ def _scrape_is_fresh() -> bool:
         return False
 
 
-def _background_scraper() -> None:
+def _backfill_days() -> int:
+    try:
+        return max(1, min(int(os.environ.get("WNBA_SYNC_BACKFILL_DAYS", "75")), 365))
+    except (TypeError, ValueError):
+        return 75
+
+
+def _background_sync() -> None:
     """
-    Background daemon thread.
-    • On cold start with a stale/empty DB: full BR scrape for all active
-      players (runs once, ~10–15 min). Skipped when the persistent DB is
-      already fresh (see _scrape_is_fresh).
-    • Every 6 hours after that: re-runs to pick up any newly completed games.
-    BR requests are rate-limited to ~20/min per the _scrape_br delays.
+    Background daemon thread (replaces the old Basketball-Reference scraper).
+    • Cold start with a stale/empty DB: backfill the last
+      WNBA_SYNC_BACKFILL_DAYS (default 75) days from balldontlie — a handful
+      of paginated calls, rate-limited to the free tier's 5 req/min.
+    • Every 6 hours: incremental sync of the last 3 days (cheap, idempotent
+      upserts pick up newly completed games and stat corrections).
     """
-    if _scrape_lock.acquire(blocking=False):
+    if _sync_lock.acquire(blocking=False):
         try:
-            if _scrape_is_fresh():
-                log.info("Background scraper: DB is fresh — skipping initial full scrape")
+            if _db_is_fresh():
+                log.info("Background sync: DB is fresh — skipping initial backfill")
             else:
-                log.info("Background scraper: initial BR scrape starting…")
-                _scrape_br(season=int(CURRENT_SEASON))
-                log.info(
-                    "Background scraper: initial BR scrape done — %d rows in DB",
-                    _db_row_count(),
-                )
+                log.info("Background sync: initial backfill starting…")
+                start = (datetime.now(ET) - timedelta(days=_backfill_days())).strftime("%Y-%m-%d")
+                _sync_bdl_logs(start, today_et())
+                log.info("Background sync: initial backfill done — %d rows in DB",
+                         _db_row_count())
         except Exception as exc:
-            log.warning("Background scraper: initial BR scrape failed: %s", exc)
+            log.warning("Background sync: initial backfill failed: %s", exc)
         finally:
-            _scrape_ready.set()
-            _scrape_lock.release()
+            _sync_ready.set()
+            _sync_lock.release()
 
     while True:
-        time.sleep(6 * 3600)  # re-scrape every 6 hours
-        if _scrape_lock.acquire(blocking=False):
+        time.sleep(6 * 3600)  # incremental sync every 6 hours
+        if _sync_lock.acquire(blocking=False):
             try:
-                _scrape_br(season=int(CURRENT_SEASON))
+                recent = (datetime.now(ET) - timedelta(days=3)).strftime("%Y-%m-%d")
+                _sync_bdl_logs(recent, today_et())
             except Exception as exc:
-                log.warning("Background scraper: incremental BR scrape failed: %s", exc)
+                log.warning("Background sync: incremental sync failed: %s", exc)
             finally:
-                _scrape_lock.release()
-
+                _sync_lock.release()
 
 # ── stats.wnba.com player game logs ───────────────────────────────────────────
 
@@ -1616,7 +1735,7 @@ def player_logs():
     else:
         cutoff = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    # 1. Query the local DB (instant — populated by background scraper)
+    # 1. Query the local DB (instant — populated by the background balldontlie sync)
     db_result = _db_query_logs([player_id], cutoff)
     if player_id in db_result:
         logs = db_result[player_id]
@@ -1658,7 +1777,7 @@ def player_logs_bulk():
     Response: { season, logs_by_player: { player_id: [{...}], ... } }
 
     Strategy:
-      1. Query the SQLite DB (built and refreshed by the background scraper).
+      1. Query the SQLite DB (built and refreshed by the background balldontlie sync).
          This is instant and covers all players in all recent games.
       2. For any player not found in the DB (DB still warming up after cold start),
          try the ESPN log index (capped at 90 days to prevent Render timeout).
@@ -1694,7 +1813,7 @@ def player_logs_bulk():
         # 2. ESPN log index for players missing from the DB.
         if missing_ids:
             db_is_cold = (
-                len(missing_ids) == len(player_ids) and not _scrape_ready.is_set()
+                len(missing_ids) == len(player_ids) and not _sync_ready.is_set()
             )
             # Building the ESPN index can be expensive (one scoreboard call per day).
             # When only a small subset of players is missing, skip that scan and go
@@ -1884,24 +2003,33 @@ def box_score():
 
 
 
-# ── /wnba/scrape ───────────────────────────────────────────────────────────────
+# ── /wnba/sync (alias /wnba/scrape) ────────────────────────────────────────────
+@app.route("/wnba/sync")
 @app.route("/wnba/scrape")
-def scrape():
+def sync():
     """
-    Manually trigger a Basketball-Reference scrape for all active WNBA players.
-    Response: { status, rows_upserted, total_rows }
+    Manually trigger a balldontlie game-log sync.
+    Query params: days (optional, default 3, max 120) — how far back to sync.
+    Response: { status, rows, games, unmapped, total_rows }
     """
-    if not _scrape_lock.acquire(blocking=False):
-        return jsonify({"status": "busy", "message": "Scrape already in progress"}), 202
+    if not BDL_API_KEY:
+        return jsonify({"status": "error", "error": "BDL_API_KEY not configured"}), 503
+    if not _sync_lock.acquire(blocking=False):
+        return jsonify({"status": "busy", "message": "Sync already in progress"}), 202
 
     try:
-        n = _scrape_br(season=int(CURRENT_SEASON))
-        return jsonify({"status": "ok", "rows_upserted": n, "total_rows": _db_row_count()})
+        try:
+            days = max(1, min(int(request.args.get("days", 3)), 120))
+        except (TypeError, ValueError):
+            days = 3
+        start = (datetime.now(ET) - timedelta(days=days)).strftime("%Y-%m-%d")
+        res = _sync_bdl_logs(start, today_et())
+        return jsonify({**res, "status": "ok", "total_rows": _db_row_count()})
     except Exception as exc:
-        log.exception("Manual BR scrape failed: %s", exc)
+        log.exception("Manual BDL sync failed: %s", exc)
         return jsonify({"status": "error", "error": str(exc)}), 500
     finally:
-        _scrape_lock.release()
+        _sync_lock.release()
 
 
 # ── /wnba/seed_import ─────────────────────────────────────────────────────────
@@ -1929,19 +2057,20 @@ def data_status():
     status = _db_status()
     status.update({
         "season": int(CURRENT_SEASON) if str(CURRENT_SEASON).isdigit() else CURRENT_SEASON,
-        "scrape_ready": _scrape_ready.is_set(),
+        "sync_ready": _sync_ready.is_set(),
+        "bdl_configured": bool(BDL_API_KEY),
         "db_path": DB_PATH,
     })
     return jsonify(status)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-# Initialise the SQLite DB and launch the background scraper before serving
+# Initialise the SQLite DB and launch the background balldontlie sync before serving
 # any requests.  Both are safe to call from the module-level on Render.
 _init_db()
 if _db_row_count() == 0:
     _seed_db_from_starter_logs()
-threading.Thread(target=_background_scraper, daemon=True, name="bg-scraper").start()
+threading.Thread(target=_background_sync, daemon=True, name="bg-sync").start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

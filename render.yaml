@@ -23,4 +23,11 @@ services:
       # (May rollover). Set it here only to force a specific season.
       - key: WNBA_BULK_FALLBACK_MAX
         value: "0"
+      # balldontlie WNBA API key (https://app.balldontlie.io — free tier: 1
+      # sport, 5 req/min). Required for the daily game-log sync that replaced
+      # Basketball-Reference scraping, and the schedule/standings fallback.
+      # Create a free account, pick WNBA as your sport, paste the key here
+      # (or set it in the dashboard instead of the blueprint).
+      - key: BDL_API_KEY
+        sync: false
     healthCheckPath: /health
