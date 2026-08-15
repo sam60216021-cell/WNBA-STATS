@@ -202,10 +202,13 @@ class BdlStandingsTests(unittest.TestCase):
 class RouteTests(unittest.TestCase):
     def setUp(self):
         srv._cache.clear()
+        srv._espn_reset_breaker()
         self.client = srv.app.test_client()
 
     def test_sync_route_requires_key(self):
-        with mock.patch.object(srv, "BDL_API_KEY", ""):
+        with mock.patch.object(srv, "BDL_API_KEY", ""), \
+             mock.patch.object(srv, "SYNC_API_KEY", ""), \
+             mock.patch.object(srv, "API_KEY", ""):
             resp = self.client.get("/wnba/sync")
         self.assertEqual(resp.status_code, 503)
 
@@ -215,8 +218,11 @@ class RouteTests(unittest.TestCase):
             srv.datetime.now(srv.ET) - srv.timedelta(days=5)
         ).strftime("%Y-%m-%d")
         with mock.patch.object(srv, "BDL_API_KEY", "test-key"), \
+             mock.patch.object(srv, "SYNC_API_KEY", "secret"), \
+             mock.patch.object(srv, "API_KEY", ""), \
              mock.patch.object(srv, "_sync_bdl_logs", return_value=fake) as m:
-            resp = self.client.get("/wnba/sync?days=5")
+            resp = self.client.get("/wnba/sync?days=5",
+                                   headers={"X-API-Key": "secret"})
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
         self.assertEqual(body["status"], "ok")
@@ -247,6 +253,83 @@ class RouteTests(unittest.TestCase):
         self.assertIn("bdl_configured", body)
         self.assertIn("sync_ready", body)
         self.assertFalse(body["bdl_configured"])
+
+
+class AdminAuthTests(unittest.TestCase):
+    """Admin endpoints require a shared secret even when read endpoints are open."""
+
+    def setUp(self):
+        srv._cache.clear()
+        self.client = srv.app.test_client()
+
+    def test_no_key_configured_disables_manual_sync(self):
+        with mock.patch.object(srv, "SYNC_API_KEY", ""), \
+             mock.patch.object(srv, "API_KEY", ""), \
+             mock.patch.object(srv, "BDL_API_KEY", "test-key"):
+            resp = self.client.get("/wnba/sync")
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("WNBA_SYNC_KEY", resp.get_json()["error"])
+
+    def test_wrong_key_is_401(self):
+        with mock.patch.object(srv, "SYNC_API_KEY", "secret"), \
+             mock.patch.object(srv, "API_KEY", ""), \
+             mock.patch.object(srv, "BDL_API_KEY", "test-key"):
+            resp = self.client.get("/wnba/sync", headers={"X-API-Key": "nope"})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_falls_back_to_wnba_api_key(self):
+        fake = {"games": 1, "rows": 2, "unmapped": 0}
+        with mock.patch.object(srv, "SYNC_API_KEY", ""), \
+             mock.patch.object(srv, "API_KEY", "shared"), \
+             mock.patch.object(srv, "BDL_API_KEY", "test-key"), \
+             mock.patch.object(srv, "_sync_bdl_logs", return_value=fake):
+            resp = self.client.get("/wnba/sync", headers={"X-API-Key": "shared"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["rows"], 2)
+
+    def test_seed_import_requires_key(self):
+        with mock.patch.object(srv, "SYNC_API_KEY", "secret"), \
+             mock.patch.object(srv, "API_KEY", ""):
+            resp = self.client.get("/wnba/seed_import")
+        self.assertEqual(resp.status_code, 401)
+
+
+class CircuitBreakerTests(unittest.TestCase):
+    def setUp(self):
+        srv._espn_reset_breaker()
+
+    def tearDown(self):
+        srv._espn_reset_breaker()
+
+    def test_opens_after_consecutive_failures(self):
+        for _ in range(srv._ESPN_CB_THRESHOLD):
+            srv._espn_note_failure()
+        self.assertFalse(srv._espn_available())
+
+    def test_success_resets_counter(self):
+        srv._espn_note_failure()
+        srv._espn_note_failure()
+        srv._espn_note_success()
+        srv._espn_note_failure()
+        self.assertTrue(srv._espn_available())   # only 1 consecutive failure
+
+    def test_open_breaker_skips_http(self):
+        for _ in range(srv._ESPN_CB_THRESHOLD):
+            srv._espn_note_failure()
+        with mock.patch.object(srv.espn, "get") as fake:
+            self.assertIsNone(srv._espn_get("https://example.invalid/x"))
+            fake.assert_not_called()
+
+    def test_espn_get_returns_json_and_resets(self):
+        for _ in range(srv._ESPN_CB_THRESHOLD - 1):
+            srv._espn_note_failure()
+        resp = mock.Mock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"events": []}
+        with mock.patch.object(srv.espn, "get", return_value=resp):
+            self.assertEqual(srv._espn_get("https://example.invalid/x"), {"events": []})
+        self.assertTrue(srv._espn_available())
+        self.assertEqual(srv._espn_cb_failures, 0)
 
 
 class DbFreshnessTests(unittest.TestCase):

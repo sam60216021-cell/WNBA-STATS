@@ -30,4 +30,11 @@ services:
       # (or set it in the dashboard instead of the blueprint).
       - key: BDL_API_KEY
         sync: false
+      # Shared secret required by the admin endpoints (/wnba/sync, /wnba/scrape,
+      # /wnba/seed_import). Generate one with: python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+      # Then call e.g.: curl -H "X-API-Key: <key>" https://<host>/wnba/sync
+      # Falls back to WNBA_API_KEY if unset; if neither is set the admin
+      # endpoints return 503 (the background sync still runs normally).
+      - key: WNBA_SYNC_KEY
+        sync: false
     healthCheckPath: /health

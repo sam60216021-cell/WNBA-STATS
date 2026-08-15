@@ -21,6 +21,7 @@ Endpoints:
   GET /wnba/lineups            — projected starters for today's games
   GET /wnba/player_logs        — game log for one player (?player_id=X&season=Y&days=N)
   GET /wnba/sync               — trigger a balldontlie game-log sync (?days=N)
+                                 (admin: requires X-API-Key = WNBA_SYNC_KEY)
 """
 
 import os
@@ -81,6 +82,71 @@ espn.headers.update({
 })
 # Avoid env/netrc auth resolution overhead and occasional import-lock stalls.
 espn.trust_env = False
+
+# ── ESPN circuit breaker ────────────────────────────────────────────────────────
+# From datacenter IPs (Render etc.) ESPN/Akamai frequently blocks every request.
+# Without protection the log-index builder alone re-fails ~60 requests every
+# 30 minutes. After _ESPN_CB_THRESHOLD consecutive *failures* (exceptions/
+# timeouts — a 200 with empty data is a success, e.g. no games that day), ESPN
+# calls short-circuit to None for _ESPN_CB_COOLDOWN seconds. Any success resets
+# the failure counter.
+_ESPN_CB_THRESHOLD  = 3      # consecutive failures before opening the breaker
+_ESPN_CB_COOLDOWN   = 3600   # seconds the breaker stays open
+
+_espn_cb_lock       = threading.Lock()
+_espn_cb_failures   = 0
+_espn_cb_open_until = 0.0
+
+
+def _espn_note_failure() -> None:
+    global _espn_cb_failures, _espn_cb_open_until
+    with _espn_cb_lock:
+        _espn_cb_failures += 1
+        if _espn_cb_failures >= _ESPN_CB_THRESHOLD:
+            _espn_cb_open_until = time.time() + _ESPN_CB_COOLDOWN
+            log.warning("ESPN circuit breaker OPEN for %ds after %d consecutive failures",
+                        _ESPN_CB_COOLDOWN, _espn_cb_failures)
+
+
+def _espn_note_success() -> None:
+    global _espn_cb_failures
+    with _espn_cb_lock:
+        _espn_cb_failures = 0
+
+
+def _espn_available() -> bool:
+    with _espn_cb_lock:
+        return time.time() >= _espn_cb_open_until
+
+
+def _espn_reset_breaker() -> None:
+    """Forget failures and close the breaker (tests / manual recovery)."""
+    global _espn_cb_failures, _espn_cb_open_until
+    with _espn_cb_lock:
+        _espn_cb_failures = 0
+        _espn_cb_open_until = 0.0
+
+
+def _espn_get(url: str, params: dict | None = None, timeout: int = 12):
+    """ESPN GET with circuit-breaker protection.
+
+    Returns parsed JSON, or None when the request failed or the breaker is
+    open. Callers already treat "no data" as "fall through to the next source".
+    """
+    if not _espn_available():
+        log.debug("ESPN circuit breaker open — skipping %s", url)
+        return None
+    try:
+        r = espn.get(url, timeout=timeout, params=params)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.warning("ESPN fetch failed %s: %s: %s", url, type(exc).__name__, exc)
+        _espn_note_failure()
+        return None
+    _espn_note_success()
+    return data
+
 
 # stats.wnba.com — requires these headers to avoid 403
 wnba_stats = requests.Session()
@@ -312,6 +378,28 @@ def _require_api_key():
     return None
 
 
+# ── Admin endpoint auth ────────────────────────────────────────────────────────
+# /wnba/sync (alias /wnba/scrape) and /wnba/seed_import can burn the
+# balldontlie rate budget or rewrite the DB, so they ALWAYS require a shared
+# secret — even when read endpoints are left unauthenticated. Set WNBA_SYNC_KEY
+# (preferred) or WNBA_API_KEY, and send it as the X-API-Key header. With no key
+# configured these endpoints return 503 (the background sync still runs).
+SYNC_API_KEY = os.environ.get("WNBA_SYNC_KEY", "").strip()
+
+
+def _admin_authorized() -> tuple[bool, int, str]:
+    """(authorized, http_status, error_message) for admin endpoints."""
+    expected = SYNC_API_KEY or API_KEY
+    if not expected:
+        return False, 503, ("manual sync disabled: set WNBA_SYNC_KEY (or "
+                            "WNBA_API_KEY) on the server and send it as X-API-Key")
+    supplied = request.headers.get("X-API-Key", "").strip()
+    if not hmac.compare_digest(supplied, expected):
+        return False, 401, "unauthorized"
+    return True, 200, ""
+
+
+
 # ── Health check ───────────────────────────────────────────────────────────────
 @app.route("/")
 @app.route("/health")
@@ -375,13 +463,7 @@ def schedule():
         "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
         f"?dates={date_nodash}"
     )
-    data = None
-    try:
-        r = espn.get(url, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:
-        log.warning("schedule fetch failed: %s: %s", type(exc).__name__, exc)
+    data = _espn_get(url)   # None when ESPN is blocked / breaker open
 
     if data is not None and not data.get("events"):
         log.warning("schedule: ESPN returned 200 but 0 events for %s", date_nodash)
@@ -490,13 +572,7 @@ def standings():
         return jsonify(cached)
 
     url = "https://site.api.espn.com/apis/v2/sports/basketball/wnba/standings"
-    data = None
-    try:
-        r = espn.get(url, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:
-        log.warning("standings fetch failed: %s", exc)
+    data = _espn_get(url)   # None when ESPN is blocked / breaker open
 
     entries = []
     for group in (data or {}).get("children", []):
@@ -758,15 +834,11 @@ def _fetch_all_players_espn(season: str = CURRENT_SEASON) -> list[dict]:
         return cached
 
     # 1. Get all WNBA team IDs
-    try:
-        r = espn.get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/teams",
-            timeout=12,
-        )
-        r.raise_for_status()
-        teams_data = r.json()
-    except Exception as exc:
-        log.warning("ESPN teams fetch failed: %s", exc)
+    teams_data = _espn_get(
+        "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/teams",
+    )
+    if teams_data is None:
+        log.warning("ESPN teams fetch failed (blocked or breaker open)")
         return []
 
     team_list = []
@@ -786,15 +858,11 @@ def _fetch_all_players_espn(season: str = CURRENT_SEASON) -> list[dict]:
     # 2. Get roster for each team
     players = []
     for team in team_list:
-        try:
-            r = espn.get(
-                f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/teams/{team['id']}/roster",
-                timeout=12,
-            )
-            r.raise_for_status()
-            roster_data = r.json()
-        except Exception as exc:
-            log.warning("ESPN roster fetch failed for team %s: %s", team["id"], exc)
+        roster_data = _espn_get(
+            f"https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/teams/{team['id']}/roster",
+        )
+        if roster_data is None:
+            log.warning("ESPN roster fetch failed for team %s (blocked or breaker open)", team["id"])
             continue
         for athlete in roster_data.get("athletes", []):
             pid  = str(athlete.get("id", ""))
@@ -1542,6 +1610,11 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
     if (cached := cache_get(cache_key)):
         return cached
 
+    if not _espn_available():
+        # ESPN is filtered from this IP — skip the ~60-request scan entirely.
+        log.debug("ESPN log index skipped — circuit breaker open")
+        return {}
+
     today_dt = datetime.now(ET)
     event_ids: list[tuple[str, str]] = []   # (event_id, game_date_iso)
 
@@ -1549,16 +1622,12 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
         day = today_dt - timedelta(days=delta)
         ds  = day.strftime("%Y%m%d")
         iso = f"{ds[:4]}-{ds[4:6]}-{ds[6:]}"
-        try:
-            r = espn.get(
-                "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
-                params={"dates": ds},
-                timeout=10,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as exc:
-            log.warning("Scoreboard fetch failed for %s: %s: %s", ds, type(exc).__name__, exc)
+        data = _espn_get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
+            params={"dates": ds},
+            timeout=10,
+        )
+        if data is None:
             return []
         return [
             (e.get("id", ""), iso)
@@ -1579,17 +1648,12 @@ def _build_espn_log_index(days: int = 60) -> dict[str, list]:
         day_pool.shutdown(wait=False, cancel_futures=True)
 
     def _fetch_summary(event_id: str, game_date: str) -> tuple[str, dict | None]:
-        try:
-            r = espn.get(
-                "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
-                params={"event": event_id},
-                timeout=10,
-            )
-            r.raise_for_status()
-            return game_date, r.json()
-        except Exception as exc:
-            log.debug("Summary %s failed: %s", event_id, exc)
-            return game_date, None
+        data = _espn_get(
+            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
+            params={"event": event_id},
+            timeout=10,
+        )
+        return game_date, data
 
     index: dict[str, list] = {}
     summary_pool = ThreadPoolExecutor(max_workers=8)
@@ -1645,16 +1709,12 @@ def lineups():
 
     # Fetch today's schedule
     date_nodash = date_iso.replace("-", "")
-    url = (
-        "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
-        f"?dates={date_nodash}"
+    sched = _espn_get(
+        "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
+        params={"dates": date_nodash},
     )
-    try:
-        r = espn.get(url, timeout=12)
-        r.raise_for_status()
-        sched = r.json()
-    except Exception as exc:
-        log.warning("lineups/schedule fetch failed: %s", exc)
+    if sched is None:
+        log.warning("lineups/schedule fetch failed (blocked or breaker open)")
         return jsonify({"date": date_iso, "rows": []})
 
     # Build team → ordered player list (top minutes = first)
@@ -1922,16 +1982,12 @@ def play_by_play():
     if (cached := cache_get(cache_key)):
         return jsonify(cached)
 
-    try:
-        r = espn.get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
-            params={"event": game_id},
-            timeout=12,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:
-        log.warning("play_by_play fetch failed for %s: %s", game_id, exc)
+    data = _espn_get(
+        "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
+        params={"event": game_id},
+    )
+    if data is None:
+        log.warning("play_by_play fetch failed for %s (blocked or breaker open)", game_id)
         return jsonify({
             "game_id": game_id,
             "play_by_play": [],
@@ -1972,16 +2028,12 @@ def box_score():
     if (cached := cache_get(cache_key)):
         return jsonify(cached)
 
-    try:
-        r = espn.get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
-            params={"event": game_id},
-            timeout=12,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:
-        log.warning("box_score fetch failed for %s: %s", game_id, exc)
+    data = _espn_get(
+        "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary",
+        params={"event": game_id},
+    )
+    if data is None:
+        log.warning("box_score fetch failed for %s (blocked or breaker open)", game_id)
         return jsonify({
             "game_id": game_id,
             "boxscore": {},
@@ -2011,7 +2063,12 @@ def sync():
     Manually trigger a balldontlie game-log sync.
     Query params: days (optional, default 3, max 120) — how far back to sync.
     Response: { status, rows, games, unmapped, total_rows }
+
+    Requires an X-API-Key header matching WNBA_SYNC_KEY (or WNBA_API_KEY).
     """
+    ok, code, err = _admin_authorized()
+    if not ok:
+        return jsonify({"status": "error", "error": err}), code
     if not BDL_API_KEY:
         return jsonify({"status": "error", "error": "BDL_API_KEY not configured"}), 503
     if not _sync_lock.acquire(blocking=False):
@@ -2038,7 +2095,12 @@ def seed_import():
     """
     Manually re-import StarterLogs seed rows into SQLite.
     Useful when upstream APIs are degraded and DB needs a quick baseline reload.
+
+    Requires an X-API-Key header matching WNBA_SYNC_KEY (or WNBA_API_KEY).
     """
+    ok, code, err = _admin_authorized()
+    if not ok:
+        return jsonify({"status": "error", "error": err}), code
     n = _seed_db_from_starter_logs()
     return jsonify({
         "status": "ok",
