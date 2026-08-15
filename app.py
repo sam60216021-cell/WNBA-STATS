@@ -19,6 +19,7 @@ Endpoints:
 import os
 import json
 import re
+import hmac
 import sqlite3
 import threading
 import time
@@ -93,7 +94,12 @@ wnba_stats.headers.update({
 wnba_stats.trust_env = False
 
 # ── WNBA constants ─────────────────────────────────────────────────────────────
-CURRENT_SEASON = os.environ.get("WNBA_SEASON", "2026")
+CURRENT_SEASON = os.environ.get("WNBA_SEASON", "") or (
+    # WNBA seasons run May–October; during the Jan–Apr offseason the
+    # "current" season is still the previous calendar year's.
+    str(datetime.now(timezone.utc).year if datetime.now(timezone.utc).month >= 5
+        else datetime.now(timezone.utc).year - 1)
+)
 
 SEED_LOG_CANDIDATES = [
     os.environ.get("WNBA_STARTER_LOGS_PATH", "").strip(),
@@ -187,6 +193,25 @@ def _parse_espn_tip(event_date_str: str) -> str:
         return dt.astimezone(ET).strftime("%-I:%M %p ET")
     except Exception:
         return ""
+
+# ── Optional shared-secret auth ────────────────────────────────────────────────
+# When the WNBA_API_KEY env var is set, every /wnba/* endpoint requires a
+# matching X-API-Key header. Root/health/ping stay open for Render's health
+# checks. Leave WNBA_API_KEY unset to run the server unauthenticated.
+API_KEY = os.environ.get("WNBA_API_KEY", "").strip()
+
+
+@app.before_request
+def _require_api_key():
+    if not API_KEY:
+        return None
+    if not request.path.startswith("/wnba/"):
+        return None
+    supplied = request.headers.get("X-API-Key", "").strip()
+    if not hmac.compare_digest(supplied, API_KEY):
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
 
 # ── Health check ───────────────────────────────────────────────────────────────
 @app.route("/")
@@ -942,6 +967,14 @@ def _db_latest_game_date_for_player(player_id: str) -> str | None:
         return row[0] if row else None
     except Exception:
         return None
+
+
+def _br_team_url_abbr(abbr: str) -> str:
+    """Map app team abbreviation to Basketball-Reference URL abbreviation."""
+    # NOTE: this helper was accidentally dropped in commit d13262b — restored
+    # verbatim from a4a64e0. Without it, _br_get_team_roster raises NameError
+    # on every cold start, so the DB never repopulates.
+    return {"LVA": "LVG", "GSV": "GSV", "WSH": "WAS"}.get(abbr, abbr)
 
 
 def _br_get_team_roster(team_abbr: str, season: int) -> list[tuple[str, str, str]]:
