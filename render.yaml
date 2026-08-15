@@ -2,11 +2,19 @@ services:
   - type: web
     name: wnba-stats
     env: python
-    rootDir: server
+    # NOTE: this repo's root *is* the service root (app.py lives here), so no
+    # rootDir is needed. If Blueprint sync was previously failing, this is why.
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     region: oregon
     plan: starter
+    # Persistent disk so the scraped game-log SQLite DB survives deploys and
+    # restarts (avoids a 10–15 min full re-scrape on every cold start).
+    # Requires a single instance — gunicorn already runs 1 worker.
+    disk:
+      name: wnba-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.14.3

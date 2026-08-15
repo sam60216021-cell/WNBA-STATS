@@ -24,7 +24,7 @@ import threading
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -659,11 +659,16 @@ def _fetch_all_players(season: str = CURRENT_SEASON) -> list[dict]:
 
 
 # ── SQLite game-log database ──────────────────────────────────────────────────
-# Stored in /tmp — always available on Render, even the free tier.
-# The filesystem is ephemeral (wiped on every deploy/restart), so the
-# background scraper repopulates it automatically on every cold start.
+# Preferred location is a Render persistent disk (see render.yaml: disk
+# `wnba-data` mounted at /var/data) so logs survive deploys/restarts.
+# Falls back to /tmp when no disk is mounted (local dev / disk detached) —
+# the background scraper repopulates it automatically on every cold start.
 
-DB_PATH = "/tmp/wnba_logs.db"
+DB_PATH = (
+    os.environ.get("WNBA_DB_PATH")
+    or ("/var/data/wnba_logs.db" if os.path.isdir("/var/data") else "/tmp/wnba_logs.db")
+)
+
 _db_write_lock = threading.Lock()
 
 
@@ -1084,21 +1089,43 @@ _scrape_lock  = threading.Lock()
 _scrape_ready = threading.Event()
 
 
+def _scrape_is_fresh() -> bool:
+    """True when the DB already holds game logs from the last ~24 h.
+
+    With the persistent disk attached, deploys/restarts no longer wipe the DB,
+    so a cold start can skip the 10–15 min full BR scrape and let the 6-hour
+    incremental loop pick up any newly completed games instead.
+    """
+    try:
+        latest = _db_status().get("latest_game_date") or ""
+        if not latest:
+            return False
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        return latest >= cutoff
+    except Exception:
+        return False
+
+
 def _background_scraper() -> None:
     """
     Background daemon thread.
-    • On cold start: full BR scrape for all active players (runs once, ~10–15 min).
+    • On cold start with a stale/empty DB: full BR scrape for all active
+      players (runs once, ~10–15 min). Skipped when the persistent DB is
+      already fresh (see _scrape_is_fresh).
     • Every 6 hours after that: re-runs to pick up any newly completed games.
     BR requests are rate-limited to ~20/min per the _scrape_br delays.
     """
     if _scrape_lock.acquire(blocking=False):
         try:
-            log.info("Background scraper: initial BR scrape starting…")
-            _scrape_br(season=int(CURRENT_SEASON))
-            log.info(
-                "Background scraper: initial BR scrape done — %d rows in DB",
-                _db_row_count(),
-            )
+            if _scrape_is_fresh():
+                log.info("Background scraper: DB is fresh — skipping initial full scrape")
+            else:
+                log.info("Background scraper: initial BR scrape starting…")
+                _scrape_br(season=int(CURRENT_SEASON))
+                log.info(
+                    "Background scraper: initial BR scrape done — %d rows in DB",
+                    _db_row_count(),
+                )
         except Exception as exc:
             log.warning("Background scraper: initial BR scrape failed: %s", exc)
         finally:
