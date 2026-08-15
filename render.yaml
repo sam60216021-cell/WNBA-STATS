@@ -7,14 +7,15 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
     region: oregon
-    plan: starter
-    # Persistent disk so the scraped game-log SQLite DB survives deploys and
-    # restarts (avoids a 10–15 min full re-scrape on every cold start).
-    # Requires a single instance — gunicorn already runs 1 worker.
-    disk:
-      name: wnba-data
-      mountPath: /var/data
-      sizeGB: 1
+    plan: free
+    # NOTE: persistent disks (to survive cold-start re-scrapes) require a paid
+    # plan. When upgrading, re-add:
+    #   disk:
+    #     name: wnba-data
+    #     mountPath: /var/data
+    #     sizeGB: 1
+    # app.py already prefers /var/data/wnba_logs.db when present and falls
+    # back to /tmp otherwise, so no code change is needed either way.
     envVars:
       - key: PYTHON_VERSION
         value: 3.14.3
