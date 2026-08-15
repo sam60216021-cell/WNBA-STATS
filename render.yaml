@@ -19,8 +19,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.14.3
-      - key: WNBA_SEASON
-        value: "2026"
+      # WNBA_SEASON deliberately not set — app.py auto-derives the season
+      # (May rollover). Set it here only to force a specific season.
       - key: WNBA_BULK_FALLBACK_MAX
         value: "0"
     healthCheckPath: /health
