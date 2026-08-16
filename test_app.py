@@ -17,6 +17,9 @@ from unittest import mock
 # Isolate the test DB (and ensure no real BDL key leaks in) BEFORE importing app.
 os.environ["WNBA_DB_PATH"] = tempfile.mktemp(prefix="wnba_test_", suffix=".db")
 os.environ.pop("BDL_API_KEY", None)
+# Keep tests deterministic: without this, the import-time background sync thread
+# can hold _sync_lock while the first test runs (flaky 202 from /wnba/sync).
+os.environ["WNBA_DISABLE_BG_SYNC"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app as srv  # noqa: E402

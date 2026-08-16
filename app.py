@@ -2129,10 +2129,14 @@ def data_status():
 # ── Entry point ────────────────────────────────────────────────────────────────
 # Initialise the SQLite DB and launch the background balldontlie sync before serving
 # any requests.  Both are safe to call from the module-level on Render.
+# Set WNBA_DISABLE_BG_SYNC=1 to skip the thread (tests / debugging).
 _init_db()
 if _db_row_count() == 0:
     _seed_db_from_starter_logs()
-threading.Thread(target=_background_sync, daemon=True, name="bg-sync").start()
+if os.environ.get("WNBA_DISABLE_BG_SYNC", "").lower() in ("1", "true", "yes"):
+    log.info("Background sync disabled via WNBA_DISABLE_BG_SYNC")
+else:
+    threading.Thread(target=_background_sync, daemon=True, name="bg-sync").start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
