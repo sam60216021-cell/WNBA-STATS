@@ -232,7 +232,16 @@ def _bdl_get(path: str, params: dict | None = None, timeout: int = 15,
             r.raise_for_status()
             return r.json()
         except Exception as exc:
-            log.warning("BDL request failed %s %s: %s", path, params, exc)
+            # Surface the response body (truncated) — BDL explains *why* it
+            # rejected the request there (e.g. 401 tier/trial reasons), which
+            # the HTTPError string alone does not include.
+            body = ""
+            try:
+                if r is not None and not r.ok and r.text:
+                    body = " — " + r.text[:200]
+            except Exception:
+                pass
+            log.warning("BDL request failed %s %s: %s%s", path, params, exc, body)
             return None
     return None
 
