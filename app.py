@@ -502,7 +502,7 @@ def schedule():
         period = comp.get("status", {}).get("period", 0)
 
         games.append({
-            "game_id":              comp.get("id", event.get("id", "")),
+            "game_id":              str(comp.get("id") or event.get("id") or ""),
             "date":                 date_iso,
             "away":                 away_abbr,
             "home":                 home_abbr,
@@ -1757,7 +1757,7 @@ def lineups():
 
         home_abbr = norm(home_c.get("team", {}).get("abbreviation", ""))
         away_abbr = norm(away_c.get("team", {}).get("abbreviation", ""))
-        game_id   = comp.get("id", event.get("id", ""))
+        game_id   = str(comp.get("id") or event.get("id") or "")
         tip       = _parse_espn_tip(event.get("date", ""))
 
         rows.append({
