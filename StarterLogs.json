@@ -1,14 +1,14 @@
 {
   "season": 2026,
-  "date": "2026-08-31",
-  "generated_at": "2026-08-31T06:25:46.627781+00:00",
+  "date": "2026-09-02",
+  "generated_at": "2026-09-02T18:06:05.293465+00:00",
   "source_status": {
-    "espn_rows": 363,
+    "espn_rows": 253,
     "stats_wnba_rows": 0,
     "no_backfill_mode": true,
     "carried_existing_rows": 0
   },
-  "note": "Generated 2026-08-30 from ESPN core events + summary data. 6318 log rows for 313 players.",
+  "note": "Generated 2026-09-02 from ESPN core events + summary data. 6320 log rows for 314 players.",
   "players": [
     {
       "player_id": "1054",
@@ -1598,6 +1598,12 @@
       "player_id": "5208983",
       "name": "Isobel Borlase",
       "team": "ATL",
+      "pos": "G"
+    },
+    {
+      "player_id": "5208985",
+      "name": "Alicia Florez",
+      "team": "WSH",
       "pos": "G"
     },
     {
@@ -111898,6 +111904,24 @@
     },
     {
       "season": 2026,
+      "player_id": "5208985",
+      "game_date": "2026-08-27",
+      "team": "WSH",
+      "opponent": "PHX",
+      "mp_seconds": 300.0,
+      "pts": 3.0,
+      "reb": 0.0,
+      "ast": 1.0,
+      "three_p": 0.0,
+      "ftm": 1.0,
+      "fga": 1.0,
+      "fta": 2.0,
+      "stl": 1.0,
+      "blk": 1.0,
+      "tov": 4.0
+    },
+    {
+      "season": 2026,
       "player_id": "3906972",
       "game_date": "2026-08-28",
       "team": "POR",
@@ -113370,6 +113394,24 @@
       "fta": 1.0,
       "stl": 1.0,
       "blk": 2.0,
+      "tov": 0.0
+    },
+    {
+      "season": 2026,
+      "player_id": "5208985",
+      "game_date": "2026-08-28",
+      "team": "WSH",
+      "opponent": "LAS",
+      "mp_seconds": 480.0,
+      "pts": 2.0,
+      "reb": 1.0,
+      "ast": 1.0,
+      "three_p": 0.0,
+      "ftm": 0.0,
+      "fga": 1.0,
+      "fta": 0.0,
+      "stl": 0.0,
+      "blk": 0.0,
       "tov": 0.0
     },
     {
