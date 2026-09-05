@@ -1,14 +1,14 @@
 {
   "season": 2026,
-  "date": "2026-09-02",
-  "generated_at": "2026-09-02T18:06:05.293465+00:00",
+  "date": "2026-09-05",
+  "generated_at": "2026-09-05T18:26:11.496841+00:00",
   "source_status": {
-    "espn_rows": 253,
+    "espn_rows": 86,
     "stats_wnba_rows": 0,
     "no_backfill_mode": true,
     "carried_existing_rows": 0
   },
-  "note": "Generated 2026-09-02 from ESPN core events + summary data. 6320 log rows for 314 players.",
+  "note": "Generated 2026-09-05 from ESPN core events + summary data. 6320 log rows for 314 players.",
   "players": [
     {
       "player_id": "1054",
